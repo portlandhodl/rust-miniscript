@@ -14,36 +14,43 @@ fn do_test(data: &[u8]) {
         (Ok(new), Ok(old)) => {
             let new_si = new.spend_info();
             let old_si = old.spend_info();
+
             assert_eq!(
-                old_si.internal_key(),
-                new_si.internal_key(),
+                old_si.internal_key().serialize(),
+                new_si.internal_key().serialize(),
+                "internal key mismatch (left is old, new is right)",
+            );
+            assert_eq!(
+                old_si.merkle_root().map(|h| h.to_string()),
+                new_si.merkle_root().map(|h| h.to_string()),
                 "merkle root mismatch (left is old, new is right)",
             );
             assert_eq!(
-                old_si.merkle_root(),
-                new_si.merkle_root(),
-                "merkle root mismatch (left is old, new is right)",
-            );
-            assert_eq!(
-                old_si.output_key(),
-                new_si.output_key(),
-                "merkle root mismatch (left is old, new is right)",
+                old_si.output_key().serialize(),
+                new_si.output_key().serialize(),
+                "output key mismatch (left is old, new is right)",
             );
 
-            // Map every leaf script to a set of all the control blocks
-            let mut new_cbs = HashMap::new();
+            // Map every leaf script (by bytes) to a set of all the control blocks (by serialized bytes)
+            let mut new_cbs: HashMap<Vec<u8>, HashSet<Vec<u8>>> = HashMap::new();
             for leaf in new_si.leaves() {
                 new_cbs
-                    .entry(leaf.script())
+                    .entry(leaf.script().as_bytes().to_vec())
                     .or_insert(HashSet::new())
-                    .insert(leaf.control_block().clone());
+                    .insert(leaf.control_block().serialize());
             }
             // ...the old code will only ever yield one of them and it's not easy to predict which one
             for leaf in new_si.leaves() {
+                let old_script: old_miniscript::bitcoin::ScriptBuf =
+                    old_miniscript::bitcoin::ScriptBuf::from_bytes(leaf.script().as_bytes().to_vec());
+                let old_lv = old_miniscript::bitcoin::taproot::LeafVersion::from_consensus(
+                    leaf.leaf_version().to_consensus(),
+                )
+                .unwrap();
                 let old_cb = old_si
-                    .control_block(&(leaf.script().into(), leaf.leaf_version()))
+                    .control_block(&(old_script, old_lv))
                     .unwrap();
-                assert!(new_cbs[leaf.script()].contains(&old_cb));
+                assert!(new_cbs[leaf.script().as_bytes()].contains(&old_cb.serialize()));
             }
         }
     }
