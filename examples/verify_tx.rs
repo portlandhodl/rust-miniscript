@@ -8,6 +8,7 @@ use miniscript::bitcoin::consensus::Decodable;
 use miniscript::bitcoin::secp256k1::Secp256k1;
 use miniscript::bitcoin::{absolute, sighash, Sequence};
 use miniscript::interpreter::KeySigPair;
+use secp256k1::ecdsa;
 
 fn main() {
     //
@@ -82,14 +83,12 @@ fn main() {
     //
     // Same, but with the wrong signature hash, to demonstrate what happens
     // given an apparently invalid script.
-    let secp = Secp256k1::new();
     let message = secp256k1::Message::from_digest([0x01; 32]);
 
     let iter = interpreter.iter_custom(Box::new(|key_sig: &KeySigPair| {
         let (pk, ecdsa_sig) = key_sig.as_ecdsa().expect("Ecdsa Sig");
         ecdsa_sig.sighash_type == bitcoin::sighash::EcdsaSighashType::All
-            && secp
-                .verify_ecdsa(&message, &ecdsa_sig.signature, &pk.inner)
+            && ecdsa::verify(&ecdsa_sig.signature,message,  &pk.inner)
                 .is_ok()
     }));
 

@@ -190,8 +190,9 @@ pub(super) fn from_txdata<'txin>(
         if !ssig_stack.is_empty() {
             Err(Error::NonEmptyScriptSig)
         } else {
-            let output_key = bitcoin::key::XOnlyPublicKey::from_slice(spk[2..].as_bytes())
-                .map_err(|_| Error::XOnlyPublicKeyParseError)?;
+            let output_key = bitcoin::key::XOnlyPublicKey::from_byte_array(
+                <[u8; 32]>::try_from(spk[2..].as_bytes()).map_err(|_| Error::XOnlyPublicKeyParseError)?
+            ).map_err(|_| Error::XOnlyPublicKeyParseError)?;
             let has_annex = wit_stack
                 .last()
                 .and_then(|x| x.as_push().ok())

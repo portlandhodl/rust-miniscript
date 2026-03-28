@@ -38,7 +38,7 @@ impl ParseableKey for bitcoin::PublicKey {
 
 impl ParseableKey for bitcoin::secp256k1::XOnlyPublicKey {
     fn from_slice(sl: &[u8]) -> Result<Self, KeyError> {
-        bitcoin::secp256k1::XOnlyPublicKey::from_slice(sl).map_err(KeyError::XOnly)
+        bitcoin::secp256k1::XOnlyPublicKey::from_byte_array(sl.try_into().expect("32 bytes")).map_err(KeyError::XOnly)
     }
 }
 

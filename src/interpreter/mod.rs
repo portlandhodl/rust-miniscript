@@ -243,7 +243,7 @@ impl<'txin> Interpreter<'txin> {
                 };
 
                 let success = msg.map(|msg| {
-                    secp.verify_ecdsa(&msg, &ecdsa_sig.signature, &key.inner)
+                    secp.verify_ecdsa(msg, &ecdsa_sig.signature, &key.inner)
                         .is_ok()
                 });
                 success.unwrap_or(false) // unwrap_or checks for errors, while success would have checksig results
@@ -277,7 +277,7 @@ impl<'txin> Interpreter<'txin> {
                 let msg =
                     sighash_msg.map(|hash| secp256k1::Message::from_digest(hash.to_byte_array()));
                 let success = msg.map(|msg| {
-                    secp.verify_schnorr(&schnorr_sig.signature, &msg, xpk)
+                    secp.verify_schnorr(&schnorr_sig.signature, msg.as_ref(), xpk)
                         .is_ok()
                 });
                 success.unwrap_or(false) // unwrap_or_default checks for errors, while success would have checksig results
@@ -1058,6 +1058,7 @@ mod tests {
     use super::inner::ToNoChecks;
     use super::*;
     use crate::miniscript::analyzable::ExtParams;
+    use secp256k1::{ ecdsa, schnorr };
 
     #[allow(clippy::type_complexity)]
     fn setup_keys_sigs(
@@ -1087,12 +1088,12 @@ mod tests {
             sk[1] = (i >> 8) as u8;
             sk[2] = (i >> 16) as u8;
 
-            let sk = secp256k1::SecretKey::from_slice(&sk[..]).expect("secret key");
+            let sk = secp256k1::SecretKey::from_secret_bytes(sk[..].try_into().expect("32 bytes")).expect("secret key");
             let pk = bitcoin::PublicKey {
-                inner: secp256k1::PublicKey::from_secret_key(&secp, &sk),
+                inner: secp256k1::PublicKey::from_secret_key(&sk),
                 compressed: true,
             };
-            let signature = secp.sign_ecdsa(&msg, &sk);
+            let signature = ecdsa::sign(msg, &sk);
             ecdsa_sigs.push(bitcoin::ecdsa::Signature {
                 signature,
                 sighash_type: bitcoin::sighash::EcdsaSighashType::All,
@@ -1102,10 +1103,10 @@ mod tests {
             pks.push(pk);
             der_sigs.push(sigser);
 
-            let keypair = bitcoin::key::Keypair::from_secret_key(&secp, &sk);
+            let keypair = bitcoin::key::Keypair::from_secret_key(&sk);
             let (x_only_pk, _parity) = bitcoin::key::XOnlyPublicKey::from_keypair(&keypair);
             x_only_pks.push(x_only_pk);
-            let schnorr_sig = secp.sign_schnorr_with_aux_rand(&msg, &keypair, &[0u8; 32]);
+            let schnorr_sig = schnorr::sign_with_aux_rand(msg.as_ref(), &keypair, &[0u8; 32]);
             let schnorr_sig = bitcoin::taproot::Signature {
                 signature: schnorr_sig,
                 sighash_type: bitcoin::sighash::TapSighashType::Default,
@@ -1118,15 +1119,14 @@ mod tests {
 
     #[test]
     fn sat_constraints() {
-        let (pks, der_sigs, ecdsa_sigs, sighash, secp, xpks, schnorr_sigs, ser_schnorr_sigs) =
+        let (pks, der_sigs, ecdsa_sigs, sighash, _secp, xpks, schnorr_sigs, ser_schnorr_sigs) =
             setup_keys_sigs(10);
-        let secp_ref = &secp;
         let vfyfn = |pksig: &KeySigPair| match pksig {
-            KeySigPair::Ecdsa(pk, ecdsa_sig) => secp_ref
-                .verify_ecdsa(&sighash, &ecdsa_sig.signature, &pk.inner)
+            KeySigPair::Ecdsa(pk, ecdsa_sig) =>
+                ecdsa::verify(&ecdsa_sig.signature, sighash, &pk.inner)
                 .is_ok(),
-            KeySigPair::Schnorr(xpk, schnorr_sig) => secp_ref
-                .verify_schnorr(&schnorr_sig.signature, &sighash, xpk)
+            KeySigPair::Schnorr(xpk, schnorr_sig) =>
+                schnorr::verify(&schnorr_sig.signature, sighash.as_ref(), xpk)
                 .is_ok(),
         };
 

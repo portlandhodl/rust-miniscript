@@ -152,7 +152,7 @@ impl<'txin> Stack<'txin> {
         // We don't really store information about which key error.
         fn bitcoin_key_from_slice(sl: &[u8], sig_type: SigType) -> Option<BitcoinKey> {
             let key: BitcoinKey = match sig_type {
-                SigType::Schnorr => bitcoin::key::XOnlyPublicKey::from_slice(sl).ok()?.into(),
+                SigType::Schnorr => bitcoin::key::XOnlyPublicKey::from_byte_array(sl.try_into().expect("32 bytes")).ok()?.into(),
                 SigType::Ecdsa => bitcoin::PublicKey::from_slice(sl).ok()?.into(),
             };
             Some(key)
