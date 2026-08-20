@@ -392,8 +392,14 @@ impl CompilerExtData {
         Self { sat_cost: left.sat_cost + right.sat_cost, dissat_cost: None }
     }
 
+    /// `and_n(a, b) == andor(a, b, 0)`. It is dissatisfiable: push a
+    /// dissatisfaction of `a` (so `a` evaluates to 0) and the `0` branch
+    /// then fails for free. Hence the dissat cost is exactly that of `a`.
+    /// (The `andor` typing rules require `a` to be dissatisfiable, so
+    /// `left.dissat_cost` is always `Some` for any `and_n` that gets
+    /// successfully constructed.)
     fn and_n(left: Self, right: Self) -> Self {
-        Self { sat_cost: left.sat_cost + right.sat_cost, dissat_cost: None }
+        Self { sat_cost: left.sat_cost + right.sat_cost, dissat_cost: left.dissat_cost }
     }
 
     fn or_b(l: Self, r: Self, lprob: PositiveF64, rprob: PositiveF64) -> Self {
