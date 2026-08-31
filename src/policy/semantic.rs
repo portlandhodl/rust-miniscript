@@ -91,6 +91,82 @@ impl<Pk: MiniscriptKey> Ord for Policy<Pk> {
     }
 }
 
+/// Represents the difference between two policies.
+///
+/// This is useful when trying to find the conditions under which two
+/// policies differ. See [`PolicyDiff::new`] for the exact semantics.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PolicyDiff<Pk: MiniscriptKey> {
+    /// Sub-policies of the first policy which have no exact match in the
+    /// second policy.
+    pub a: Vec<Policy<Pk>>,
+    /// Sub-policies of the second policy which have no exact match in the
+    /// first policy.
+    pub b: Vec<Policy<Pk>>,
+}
+
+impl<Pk: MiniscriptKey> PolicyDiff<Pk> {
+    /// Computes the difference between two policies.
+    ///
+    /// Both policies are first [normalized](Policy::normalized). If the
+    /// normalized policies are equal, the difference is empty. Otherwise,
+    /// if both policies are thresholds with equal `k` and `n`, children
+    /// that compare equal are matched up (independently of their position)
+    /// and the difference consists of the unmatched children of each policy.
+    /// In all other cases the difference consists of the two policies
+    /// themselves.
+    ///
+    /// Note that this is a purely syntactic comparison: it does not attempt
+    /// to reason about the semantic equivalence of the differing
+    /// sub-policies.
+    pub fn new(a: Policy<Pk>, b: Policy<Pk>) -> Self {
+        fn diff<Pk: MiniscriptKey>(a: Policy<Pk>, b: Policy<Pk>) -> PolicyDiff<Pk> {
+            if a == b {
+                return PolicyDiff { a: vec![], b: vec![] };
+            }
+            match (a, b) {
+                (Policy::Thresh(t_a), Policy::Thresh(t_b))
+                    if t_a.k() == t_b.k() && t_a.n() == t_b.n() =>
+                {
+                    // Match up children that compare equal, consuming each
+                    // child of `b` at most once so that duplicated children
+                    // are handled correctly.
+                    let mut b_matched = vec![false; t_b.n()];
+                    let mut diff_a = Vec::new();
+                    for sub_a in t_a {
+                        let pos = t_b
+                            .iter()
+                            .zip(b_matched.iter().copied())
+                            .position(|(sub_b, matched)| !matched && **sub_b == *sub_a);
+                        match pos {
+                            Some(j) => b_matched[j] = true,
+                            None => diff_a.push(sub_a.as_ref().clone()),
+                        }
+                    }
+                    let diff_b = t_b
+                        .into_iter()
+                        .zip(b_matched)
+                        .filter(|(_, matched)| !matched)
+                        .map(|(sub_b, _)| sub_b.as_ref().clone())
+                        .collect();
+                    PolicyDiff { a: diff_a, b: diff_b }
+                }
+                (a, b) => PolicyDiff { a: vec![a], b: vec![b] },
+            }
+        }
+
+        diff(a.normalized(), b.normalized())
+    }
+
+    /// Combines two policy differences into one.
+    // Policies should not generally contain repeated conditions, so no
+    // attempt is made to deduplicate the combined differences.
+    pub fn combine(&mut self, second: Self) {
+        self.a.extend(second.a);
+        self.b.extend(second.b);
+    }
+}
+
 impl<Pk: MiniscriptKey> ForEachKey<Pk> for Policy<Pk> {
     fn for_each_key<'a, F: FnMut(&'a Pk) -> bool>(&'a self, mut pred: F) -> bool {
         self.pre_order_iter().all(|policy| match policy {
@@ -384,6 +460,157 @@ impl<Pk: MiniscriptKey> Policy<Pk> {
                     }
                 }
                 w.write_str(")")
+            }
+        }
+    }
+}
+
+impl<Pk: MiniscriptKey> Policy<Pk> {
+    /// Renders the policy as a tree in the style of the UNIX `tree` command.
+    ///
+    /// Each node of the tree is rendered on its own line; threshold
+    /// combiners are rendered as `and`, `or` or `thresh(k)` and leaf
+    /// fragments are rendered in policy syntax (`pk(..)`, `older(..)`, ...).
+    ///
+    /// This is intended for debugging and display purposes; the output
+    /// cannot be parsed back into a policy.
+    pub fn to_tree_string(&self) -> String {
+        let mut s = String::new();
+        self.write_tree(&mut s, "", true, None)
+            .expect("writing to a String is infallible");
+        // Remove the trailing newline.
+        s.pop();
+        s
+    }
+
+    /// Renders the difference between two policies as a tree.
+    ///
+    /// Structure that is shared by both policies is rendered once, in the
+    /// style of [`Policy::to_tree_string`]. Sub-policies that differ are
+    /// rendered as a pair of trees whose root lines are prefixed with `- `
+    /// (present only in `self`) and `+ ` (present only in `other`).
+    ///
+    /// The policies are compared as-is; call [`Policy::normalized`] on both
+    /// policies first to erase differences that are removed by
+    /// normalization.
+    ///
+    /// This is intended for debugging and display purposes; the output
+    /// cannot be parsed back into a policy.
+    pub fn to_diff_string(&self, other: &Self) -> String {
+        let mut s = String::new();
+        self.write_diff(other, &mut s, "", true)
+            .expect("writing to a String is infallible");
+        // Remove the trailing newline.
+        s.pop();
+        s
+    }
+
+    // Writes the label of a single node: the combiner name for thresholds
+    // (whose children are rendered on their own lines) or the full fragment
+    // in policy syntax for leaves.
+    fn write_node_label<W: fmt::Write>(&self, w: &mut W) -> fmt::Result {
+        match *self {
+            Self::Thresh(ref thresh) if thresh.is_and() => w.write_str("and"),
+            Self::Thresh(ref thresh) if thresh.is_or() => w.write_str("or"),
+            Self::Thresh(ref thresh) => write!(w, "thresh({})", thresh.k()),
+            _ => self.write_policy_syntax(w),
+        }
+    }
+
+    // Helper for `to_tree_string`. Renders the policy as a tree where
+    // `prefix` is prepended to the line of the root node and `last`
+    // indicates whether the policy is the last child of its parent. If
+    // `mark` is set, the root line is additionally prefixed with the given
+    // character (used by `to_diff_string` to mark differing sub-policies).
+    fn write_tree<W: fmt::Write>(
+        &self,
+        w: &mut W,
+        prefix: &str,
+        last: bool,
+        mark: Option<char>,
+    ) -> fmt::Result {
+        w.write_str(prefix)?;
+        w.write_str(if last { "`-- " } else { "|-- " })?;
+        if let Some(mark) = mark {
+            write!(w, "{} ", mark)?;
+        }
+        self.write_node_label(w)?;
+        w.write_str("\n")?;
+
+        if let Self::Thresh(ref thresh) = *self {
+            let mut child_prefix = String::from(prefix);
+            child_prefix.push_str(if last { "    " } else { "|   " });
+            let last_child = thresh.n() - 1;
+            for (i, child) in thresh.iter().enumerate() {
+                child.write_tree(w, &child_prefix, i == last_child, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    // Helper for `to_diff_string`; see `write_tree` for the meaning of the
+    // `prefix` and `last` arguments.
+    fn write_diff<W: fmt::Write>(
+        &self,
+        other: &Self,
+        w: &mut W,
+        prefix: &str,
+        last: bool,
+    ) -> fmt::Result {
+        match (self, other) {
+            (x, y) if x == y => x.write_tree(w, prefix, last, None),
+            (Self::Thresh(t_a), Self::Thresh(t_b)) if t_a.k() == t_b.k() && t_a.n() == t_b.n() => {
+                // The two thresholds have the same shape; render a single
+                // node and recurse into the children, pairing up children
+                // that do not compare equal.
+                w.write_str(prefix)?;
+                w.write_str(if last { "`-- " } else { "|-- " })?;
+                self.write_node_label(w)?;
+                w.write_str("\n")?;
+
+                let mut child_prefix = String::from(prefix);
+                child_prefix.push_str(if last { "    " } else { "|   " });
+
+                // Match up children that compare equal, consuming each child
+                // of `other` at most once. Since both thresholds have the
+                // same number of children, the unmatched children of `self`
+                // and `other` can be paired up in order.
+                let mut b_matched = vec![false; t_b.n()];
+                let mut a_matched = Vec::with_capacity(t_a.n());
+                for sub_a in t_a.iter() {
+                    let pos = t_b
+                        .iter()
+                        .zip(b_matched.iter().copied())
+                        .position(|(sub_b, matched)| !matched && sub_b == sub_a);
+                    match pos {
+                        Some(j) => {
+                            b_matched[j] = true;
+                            a_matched.push(true);
+                        }
+                        None => a_matched.push(false),
+                    }
+                }
+
+                let last_child = t_a.n() - 1;
+                let mut j = 0; // index of the next unmatched child of `other`
+                for (i, sub_a) in t_a.iter().enumerate() {
+                    if a_matched[i] {
+                        sub_a.write_tree(w, &child_prefix, i == last_child, None)?;
+                    } else {
+                        while b_matched[j] {
+                            j += 1;
+                        }
+                        sub_a.write_diff(&t_b.data()[j], w, &child_prefix, i == last_child)?;
+                        j += 1;
+                    }
+                }
+                Ok(())
+            }
+            (x, y) => {
+                // The sub-policies have nothing in common; render both,
+                // marking the root lines with `- ` and `+ ` respectively.
+                x.write_tree(w, prefix, last, Some('-'))?;
+                y.write_tree(w, prefix, last, Some('+'))
             }
         }
     }
@@ -1453,6 +1680,136 @@ mod tests {
         );
         assert_eq!(policy.n_keys(), 0);
         assert_eq!(policy.minimum_n_keys(), Some(0));
+    }
+
+    #[test]
+    fn policy_diff() {
+        let pol1 = StringPolicy::from_str("or(pk(A),pk(C))").unwrap();
+        let pol2 = StringPolicy::from_str("or(pk(B),pk(C))").unwrap();
+        let diff = PolicyDiff::new(pol1.clone(), pol2.clone());
+        assert_eq!(
+            diff,
+            PolicyDiff::new(
+                StringPolicy::from_str("pk(A)").unwrap(),
+                StringPolicy::from_str("pk(B)").unwrap(),
+            )
+        );
+        assert_eq!(diff.a, vec![StringPolicy::from_str("pk(A)").unwrap()]);
+        assert_eq!(diff.b, vec![StringPolicy::from_str("pk(B)").unwrap()]);
+
+        // The order of threshold children does not matter.
+        let pol1 = StringPolicy::from_str("or(pk(A),pk(C))").unwrap();
+        let pol2 = StringPolicy::from_str("or(pk(C),and(pk(B),older(9)))").unwrap();
+        let diff = PolicyDiff::new(pol1, pol2);
+        assert_eq!(
+            diff,
+            PolicyDiff::new(
+                StringPolicy::from_str("pk(A)").unwrap(),
+                StringPolicy::from_str("and(pk(B),older(9))").unwrap(),
+            )
+        );
+
+        // Identical policies have an empty difference.
+        let pol = StringPolicy::from_str("or(pk(A),and(pk(B),older(9)))").unwrap();
+        let diff = PolicyDiff::new(pol.clone(), pol);
+        assert_eq!(diff, PolicyDiff { a: vec![], b: vec![] });
+
+        // Duplicated children are matched up one-for-one.
+        let pol1 = StringPolicy::from_str("or(pk(A),pk(A))").unwrap();
+        let pol2 = StringPolicy::from_str("or(pk(A),pk(B))").unwrap();
+        let diff = PolicyDiff::new(pol1, pol2);
+        assert_eq!(diff.a, vec![StringPolicy::from_str("pk(A)").unwrap()]);
+        assert_eq!(diff.b, vec![StringPolicy::from_str("pk(B)").unwrap()]);
+
+        // Thresholds with different `k` or `n` compare wholesale.
+        let pol1 = StringPolicy::from_str("or(pk(A),pk(C))").unwrap();
+        let pol2 = StringPolicy::from_str("and(pk(A),pk(C))").unwrap();
+        let diff = PolicyDiff::new(pol1.clone(), pol2.clone());
+        assert_eq!(diff, PolicyDiff { a: vec![pol1], b: vec![pol2] });
+
+        // Combining differences concatenates both sides.
+        let mut diff1 = PolicyDiff::new(
+            StringPolicy::from_str("pk(A)").unwrap(),
+            StringPolicy::from_str("pk(B)").unwrap(),
+        );
+        let diff2 = PolicyDiff::new(
+            StringPolicy::from_str("pk(C)").unwrap(),
+            StringPolicy::from_str("pk(D)").unwrap(),
+        );
+        diff1.combine(diff2);
+        assert_eq!(
+            diff1,
+            PolicyDiff {
+                a: vec![
+                    StringPolicy::from_str("pk(A)").unwrap(),
+                    StringPolicy::from_str("pk(C)").unwrap()
+                ],
+                b: vec![
+                    StringPolicy::from_str("pk(B)").unwrap(),
+                    StringPolicy::from_str("pk(D)").unwrap()
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn policy_tree_string() {
+        let pol =
+            StringPolicy::from_str("or(pk(A),and(pk(B),older(9)),thresh(2,pk(C),pk(D),pk(E)))")
+                .unwrap();
+        let expected = "\
+`-- or
+    |-- pk(A)
+    |-- and
+    |   |-- pk(B)
+    |   `-- older(9)
+    `-- thresh(2)
+        |-- pk(C)
+        |-- pk(D)
+        `-- pk(E)";
+        assert_eq!(pol.to_tree_string(), expected);
+
+        // Leaves render as a single line.
+        let pol = StringPolicy::from_str("pk(A)").unwrap();
+        assert_eq!(pol.to_tree_string(), "`-- pk(A)");
+    }
+
+    #[test]
+    fn policy_diff_string() {
+        let pol1 = StringPolicy::from_str("or(pk(A),pk(C))").unwrap();
+        let pol2 = StringPolicy::from_str("or(pk(C),and(pk(B),older(9)))").unwrap();
+        let expected = "\
+`-- or
+    |-- - pk(A)
+    |-- + and
+    |   |-- pk(B)
+    |   `-- older(9)
+    `-- pk(C)";
+        assert_eq!(pol1.to_diff_string(&pol2), expected);
+
+        // Identical policies render as a single unmarked tree.
+        let pol = StringPolicy::from_str("or(pk(A),pk(C))").unwrap();
+        assert_eq!(pol.to_diff_string(&pol.clone()), pol.to_tree_string());
+
+        // Policies with nothing in common render as a `- `/`+ ` pair.
+        let pol1 = StringPolicy::from_str("pk(A)").unwrap();
+        let pol2 = StringPolicy::from_str("older(9)").unwrap();
+        let expected = "\
+`-- - pk(A)
+`-- + older(9)";
+        assert_eq!(pol1.to_diff_string(&pol2), expected);
+
+        // Differences nested inside shared structure are recursed into.
+        let pol1 = StringPolicy::from_str("or(pk(A),and(pk(B),older(9)))").unwrap();
+        let pol2 = StringPolicy::from_str("or(pk(A),and(pk(B),older(10)))").unwrap();
+        let expected = "\
+`-- or
+    |-- pk(A)
+    `-- and
+        |-- pk(B)
+        `-- - older(9)
+        `-- + older(10)";
+        assert_eq!(pol1.to_diff_string(&pol2), expected);
     }
 
     #[test]
