@@ -24,12 +24,15 @@ use bitcoin::script::PushBytesBuf;
 use bitcoin::taproot::{ControlBlock, LeafVersion, TapLeafHash};
 use bitcoin::{absolute, bip32, psbt, relative, ScriptBuf, WitnessVersion};
 
-use crate::descriptor::{self, Descriptor, DescriptorType, KeyMap};
+use crate::descriptor::{self, Descriptor, DescriptorType, KeyMap, ShInner};
 use crate::miniscript::hash256;
 use crate::miniscript::satisfy::{Placeholder, Satisfier, SchnorrSigType};
 use crate::prelude::*;
 use crate::util::witness_size;
-use crate::{DefiniteDescriptorKey, DescriptorPublicKey, Error, MiniscriptKey, ToPublicKey};
+use crate::{
+    DefiniteDescriptorKey, DescriptorPublicKey, Error, Miniscript, MiniscriptKey, ScriptContext,
+    Terminal, Threshold, ToPublicKey,
+};
 
 /// Trait describing a present/missing lookup table for constructing witness templates
 ///
@@ -725,6 +728,382 @@ impl Assets {
     }
 }
 
+/// Combines the asset requirements of two sub-fragments of the same spending
+/// path into a single requirement set.
+///
+/// Returns `None` when the timelock requirements are incompatible, i.e. when
+/// one fragment requires a height-based lock and the other a time-based lock
+/// of the same kind; such a spending path can never be used. Otherwise the
+/// later of two same-unit locktimes is kept, since it implies the earlier one.
+fn merge_assets(a: &Assets, b: &Assets) -> Option<Assets> {
+    fn merge_locktime<T: Copy + PartialOrd>(a: Option<T>, b: Option<T>) -> Option<Option<T>> {
+        match (a, b) {
+            (None, x) | (x, None) => Some(x),
+            (Some(x), Some(y)) => match x.partial_cmp(&y) {
+                // Locktimes of different units are not comparable.
+                None => None,
+                Some(core::cmp::Ordering::Less) => Some(Some(y)),
+                Some(_) => Some(Some(x)),
+            },
+        }
+    }
+
+    let mut merged = a.clone();
+    merged.keys.extend(b.keys.iter().cloned());
+    merged
+        .sha256_preimages
+        .extend(b.sha256_preimages.iter().copied());
+    merged
+        .hash256_preimages
+        .extend(b.hash256_preimages.iter().copied());
+    merged
+        .ripemd160_preimages
+        .extend(b.ripemd160_preimages.iter().copied());
+    merged
+        .hash160_preimages
+        .extend(b.hash160_preimages.iter().copied());
+    merged.absolute_timelock = merge_locktime(a.absolute_timelock, b.absolute_timelock)?;
+    merged.relative_timelock = merge_locktime(a.relative_timelock, b.relative_timelock)?;
+    Some(merged)
+}
+
+/// Calls `f` once with every combination of `k` distinct indices out of `0..n`.
+///
+/// Implemented iteratively so that it cannot overflow the stack for thresholds
+/// with a large number of elements.
+fn for_each_combination(n: usize, k: usize, mut f: impl FnMut(&[usize])) {
+    if k > n {
+        return;
+    }
+    let mut combination: Vec<usize> = (0..k).collect();
+    loop {
+        f(&combination);
+        // Find the rightmost index that can still be incremented.
+        let mut i = k;
+        loop {
+            if i == 0 {
+                return;
+            }
+            i -= 1;
+            if combination[i] < n - k + i {
+                break;
+            }
+        }
+        combination[i] += 1;
+        for j in i + 1..k {
+            combination[j] = combination[j - 1] + 1;
+        }
+    }
+}
+
+/// Enumerates the spending paths of a `multi`/`multi_a`-style fragment: one
+/// [`Assets`] per combination of `k` keys out of `n`.
+fn multi_key_assets<const MAX: usize>(
+    threshold: &Threshold<DescriptorPublicKey, MAX>,
+) -> Vec<Assets> {
+    let mut paths = Vec::new();
+    for_each_combination(threshold.n(), threshold.k(), |combination| {
+        paths.push(Assets::from_iter(combination.iter().map(|&i| threshold.data()[i].clone())));
+    });
+    paths
+}
+
+/// Number of ways to choose `k` out of `n` elements, saturating at `u64::MAX`.
+///
+/// Once the true value exceeds `u64::MAX` it only keeps growing, so a saturated
+/// result stays far above any caller-provided enumeration limit.
+fn binomial_saturating(n: usize, k: usize) -> u64 {
+    let (n, mut k) = (n as u64, k as u64);
+    if k > n {
+        return 0;
+    }
+    if k > n - k {
+        k = n - k;
+    }
+    // Invariant: after `i` iterations `result == binomial(n, i)` exactly,
+    // unless it has saturated (see doc comment).
+    let mut result: u64 = 1;
+    for i in 0..k {
+        result = result.saturating_mul(n - i) / (i + 1);
+    }
+    result
+}
+
+/// Number of spending paths of a `thresh(k, ...)` fragment whose children have
+/// the given numbers of spending paths; saturates at `u64::MAX`.
+///
+/// This is the elementary symmetric sum `e_k` of `counts`: the sum over all
+/// `k`-element subsets of the product of the subset's counts. It is computed by
+/// dynamic programming in O(n * k), since the number of subsets itself may be
+/// astronomical even when the result is small (e.g. if some counts are zero).
+fn thresh_path_count(counts: &[u64], k: usize) -> u64 {
+    // dp[j] == e_j of the counts processed so far.
+    let mut dp = vec![0u64; k + 1];
+    dp[0] = 1;
+    for &count in counts {
+        for j in (1..=k).rev() {
+            dp[j] = dp[j].saturating_add(count.saturating_mul(dp[j - 1]));
+        }
+    }
+    dp[k]
+}
+
+impl<Ctx: ScriptContext> Terminal<DescriptorPublicKey, Ctx> {
+    /// Upper bound on the number of spending paths of this fragment; saturates
+    /// at `u64::MAX`.
+    ///
+    /// This is exact except when a spending path would require mutually
+    /// incompatible timelocks (see [`merge_assets`]): such impossible paths are
+    /// counted here even though they can never actually be used.
+    fn count_assets(&self) -> u64 {
+        use Terminal::*;
+        match *self {
+            False => 0,
+            True | PkK(..) | PkH(..) | RawPkH(..) | After(..) | Older(..) | Sha256(..)
+            | Hash256(..) | Ripemd160(..) | Hash160(..) => 1,
+            Alt(ref ms) | Swap(ref ms) | Check(ref ms) | DupIf(ref ms) | Verify(ref ms)
+            | NonZero(ref ms) | ZeroNotEqual(ref ms) => ms.node.count_assets(),
+            AndV(ref left, ref right) | AndB(ref left, ref right) => left
+                .node
+                .count_assets()
+                .saturating_mul(right.node.count_assets()),
+            AndOr(ref a, ref b, ref c) => a
+                .node
+                .count_assets()
+                .saturating_mul(b.node.count_assets())
+                .saturating_add(c.node.count_assets()),
+            OrB(ref left, ref right)
+            | OrC(ref left, ref right)
+            | OrD(ref left, ref right)
+            | OrI(ref left, ref right) => left
+                .node
+                .count_assets()
+                .saturating_add(right.node.count_assets()),
+            Thresh(ref t) => {
+                let counts: Vec<u64> = t.iter().map(|ms| ms.node.count_assets()).collect();
+                thresh_path_count(&counts, t.k())
+            }
+            Multi(ref t) | SortedMulti(ref t) => binomial_saturating(t.n(), t.k()),
+            MultiA(ref t) | SortedMultiA(ref t) => binomial_saturating(t.n(), t.k()),
+        }
+    }
+
+    /// Enumerates the spending paths of this fragment, one [`Assets`] per path.
+    ///
+    /// Callers must have bounded the size of the result, e.g. by checking
+    /// [`Self::count_assets`] against a limit, since the number of spending
+    /// paths may be exponential in the size of the fragment.
+    fn all_assets(&self) -> Vec<Assets> {
+        use Terminal::*;
+        match *self {
+            True => vec![Assets::new()],
+            False => vec![],
+            PkK(ref pk) | PkH(ref pk) => vec![Assets::new().add(pk.clone())],
+            // Only obtainable by inferring a miniscript from a raw script;
+            // spending it requires the full public key, i.e. the hash160
+            // preimage of the key hash.
+            RawPkH(ref hash) => vec![Assets::new().add(*hash)],
+            After(ref t) => vec![Assets::new().after((*t).into())],
+            Older(ref t) => vec![Assets::new().older((*t).into())],
+            Sha256(ref hash) => vec![Assets::new().add(*hash)],
+            Hash256(ref hash) => vec![Assets::new().add(*hash)],
+            Ripemd160(ref hash) => vec![Assets::new().add(*hash)],
+            Hash160(ref hash) => vec![Assets::new().add(*hash)],
+            Alt(ref ms) | Swap(ref ms) | Check(ref ms) | DupIf(ref ms) | Verify(ref ms)
+            | NonZero(ref ms) | ZeroNotEqual(ref ms) => ms.node.all_assets(),
+            AndV(ref left, ref right) | AndB(ref left, ref right) => {
+                let (left, right) = (left.node.all_assets(), right.node.all_assets());
+                let mut paths = Vec::with_capacity(left.len() * right.len());
+                for a in &left {
+                    for b in &right {
+                        paths.extend(merge_assets(a, b));
+                    }
+                }
+                paths
+            }
+            AndOr(ref a, ref b, ref c) => {
+                let (a, b) = (a.node.all_assets(), b.node.all_assets());
+                let mut paths = Vec::with_capacity(a.len() * b.len());
+                for x in &a {
+                    for y in &b {
+                        paths.extend(merge_assets(x, y));
+                    }
+                }
+                paths.extend(c.node.all_assets());
+                paths
+            }
+            OrB(ref left, ref right)
+            | OrC(ref left, ref right)
+            | OrD(ref left, ref right)
+            | OrI(ref left, ref right) => {
+                let mut paths = left.node.all_assets();
+                paths.extend(right.node.all_assets());
+                paths
+            }
+            Thresh(ref t) => {
+                // Spending a thresh requires satisfying `k` of its children;
+                // children without a spending path can never be among them.
+                let sub_paths: Vec<Vec<Assets>> = t
+                    .iter()
+                    .map(|ms| ms.node.all_assets())
+                    .filter(|paths| !paths.is_empty())
+                    .collect();
+                let mut paths = Vec::new();
+                for_each_combination(sub_paths.len(), t.k(), |combination| {
+                    // The requirements of a k-of-n choice are the union of the
+                    // requirements of one path from each chosen child.
+                    let mut merged = vec![Assets::new()];
+                    for &i in combination {
+                        let mut next = Vec::new();
+                        for a in &merged {
+                            for b in &sub_paths[i] {
+                                next.extend(merge_assets(a, b));
+                            }
+                        }
+                        merged = next;
+                        if merged.is_empty() {
+                            break;
+                        }
+                    }
+                    paths.extend(merged);
+                });
+                paths
+            }
+            Multi(ref t) | SortedMulti(ref t) => multi_key_assets(t),
+            MultiA(ref t) | SortedMultiA(ref t) => multi_key_assets(t),
+        }
+    }
+}
+
+impl<Ctx: ScriptContext> Miniscript<DescriptorPublicKey, Ctx> {
+    /// Returns a list of [`Assets`], one for each spending path of this
+    /// miniscript.
+    ///
+    /// Each returned [`Assets`] describes one way in which the miniscript can
+    /// be satisfied: which keys need to sign, which hash preimages need to be
+    /// known and which absolute/relative timelocks need to have expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TooManySpendPaths`], without enumerating anything, if
+    /// the miniscript has more than `limit` spending paths. Note that the
+    /// number of spending paths can grow exponentially with the size of the
+    /// miniscript (e.g. a `thresh` of disjunctions), so a limit should always
+    /// be provided when handling untrusted input. The check is conservative:
+    /// impossible paths, which would require mutually incompatible timelocks,
+    /// are counted towards the limit even though they are omitted from the
+    /// result.
+    pub fn all_assets(&self, limit: usize) -> Result<Vec<Assets>, Error> {
+        if self.node.count_assets() > limit as u64 {
+            return Err(Error::TooManySpendPaths);
+        }
+        Ok(self.node.all_assets())
+    }
+}
+
+impl Descriptor<DescriptorPublicKey> {
+    /// Upper bound on the number of spending paths of this descriptor;
+    /// saturates at `u64::MAX`. See [`Terminal::count_assets`].
+    fn count_assets(&self) -> u64 {
+        match *self {
+            Self::Bare(ref bare) => bare.as_inner().node.count_assets(),
+            Self::Pkh(..) | Self::Wpkh(..) => 1,
+            Self::Sh(ref sh) => match *sh.as_inner() {
+                ShInner::Wsh(ref wsh) => wsh.as_inner().node.count_assets(),
+                ShInner::Wpkh(..) => 1,
+                ShInner::Ms(ref ms) => ms.node.count_assets(),
+            },
+            Self::Wsh(ref wsh) => wsh.as_inner().node.count_assets(),
+            Self::Tr(ref tr) => tr
+                .tap_tree()
+                .map_or(0, |tree| {
+                    tree.leaves().fold(0u64, |count, leaf| {
+                        count.saturating_add(leaf.miniscript().node.count_assets())
+                    })
+                })
+                // +1 for the key-spend path with the internal key.
+                .saturating_add(1),
+        }
+    }
+
+    /// Returns a list of [`Assets`], one for each spending path of this
+    /// descriptor.
+    ///
+    /// Each returned [`Assets`] describes one way in which the descriptor can
+    /// be satisfied: which keys need to sign, which hash preimages need to be
+    /// known and which absolute/relative timelocks need to have expired. Every
+    /// returned set is sufficient to construct a [`Plan`], assuming the assets
+    /// are actually available, by passing it to [`Descriptor::into_plan`] on
+    /// the corresponding definite descriptor.
+    ///
+    /// For taproot descriptors the key-spend path with the internal key is
+    /// always available and is returned as the first entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TooManySpendPaths`], without enumerating anything, if
+    /// the descriptor has more than `limit` spending paths. Note that the
+    /// number of spending paths can grow exponentially with the size of the
+    /// descriptor (e.g. a `thresh` of disjunctions), so a limit should always
+    /// be provided when handling untrusted input. The check is conservative:
+    /// impossible paths, which would require mutually incompatible timelocks,
+    /// are counted towards the limit even though they are omitted from the
+    /// result.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use core::str::FromStr;
+    ///
+    /// use miniscript::{Descriptor, DescriptorPublicKey};
+    ///
+    /// let desc = Descriptor::<DescriptorPublicKey>::from_str(
+    ///     "wsh(or_b(pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798),\
+    ///     s:pk(02b33eeea5cd309376cf82914dce386f26459a07354add732069b90abd907674cb)))",
+    /// )
+    /// .unwrap();
+    ///
+    /// // Two spending paths, one per branch of the `or`.
+    /// let paths = desc.all_assets(10_000).unwrap();
+    /// assert_eq!(paths.len(), 2);
+    ///
+    /// // Every asset set is sufficient to construct a spending plan.
+    /// let definite = desc.into_definite().unwrap();
+    /// for assets in &paths {
+    ///     assert!(definite.clone().into_plan(assets).is_ok());
+    /// }
+    ///
+    /// // A descriptor with more than `limit` spending paths is rejected.
+    /// assert!(desc.all_assets(1).is_err());
+    /// ```
+    pub fn all_assets(&self, limit: usize) -> Result<Vec<Assets>, Error> {
+        if self.count_assets() > limit as u64 {
+            return Err(Error::TooManySpendPaths);
+        }
+        Ok(match *self {
+            Self::Bare(ref bare) => bare.as_inner().node.all_assets(),
+            Self::Pkh(ref pkh) => vec![Assets::new().add(pkh.as_inner().clone())],
+            Self::Wpkh(ref wpkh) => vec![Assets::new().add(wpkh.as_inner().clone())],
+            Self::Sh(ref sh) => match *sh.as_inner() {
+                ShInner::Wsh(ref wsh) => wsh.as_inner().node.all_assets(),
+                ShInner::Wpkh(ref wpkh) => vec![Assets::new().add(wpkh.as_inner().clone())],
+                ShInner::Ms(ref ms) => ms.node.all_assets(),
+            },
+            Self::Wsh(ref wsh) => wsh.as_inner().node.all_assets(),
+            Self::Tr(ref tr) => {
+                // The key-spend path with the internal key is always available.
+                let mut paths = vec![Assets::new().add(tr.internal_key().clone())];
+                if let Some(tree) = tr.tap_tree() {
+                    for leaf in tree.leaves() {
+                        paths.extend(leaf.miniscript().node.all_assets());
+                    }
+                }
+                paths
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::str::FromStr;
@@ -1259,5 +1638,277 @@ mod test {
         .unwrap();
 
         assert!(desc.into_plan(&assets).is_err());
+    }
+
+    // ==== Tests for spend path enumeration (`Descriptor`/`Miniscript::all_assets`) ====
+
+    const KEY_A: &str = "02638737cb676ca8851ac3e2c155e16cf9186d8d576e5670d76d49f8840113d078";
+    const KEY_B: &str = "02b33eeea5cd309376cf82914dce386f26459a07354add732069b90abd907674cb";
+    const KEY_C: &str = "02722c78fed469dd77df4a2c92c5bf4ddfa583fad30a1b7993488530d2d097393c";
+    const KEY_D: &str = "036a7ae441409bd40af1b8efba7dbd34b822b9a72566eff10b889b8de13659e343";
+    const KEY_E: &str = "03b6c8a1a901edf3c5f1cb0e3ffe1f20393435a5d467f435e2858c9ab43d3ca78c";
+    const KEY_XONLY: &str = "015e4cb53458bf813db8c79968e76e10d13ed6426a23fa71c2f41ba021c2a7ab";
+
+    type SegwitMs = Miniscript<DescriptorPublicKey, Segwitv0>;
+
+    /// The [`Assets`] requiring exactly the given keys.
+    fn assets_of(keys: &[&str]) -> Assets {
+        Assets::from_iter(
+            keys.iter()
+                .map(|k| DescriptorPublicKey::from_str(k).unwrap()),
+        )
+    }
+
+    /// Generates `n` distinct key strings, with secret keys 1, 2, ...
+    fn generate_keys(n: u16) -> Vec<String> {
+        let secp = Secp256k1::new();
+        (1..=n)
+            .map(|i| {
+                let mut buf = [0u8; 32];
+                buf[..2].copy_from_slice(&i.to_le_bytes());
+                let sk = secp256k1::SecretKey::from_slice(&buf).unwrap();
+                bitcoin::PublicKey::new(sk.public_key(&secp)).to_string()
+            })
+            .collect()
+    }
+
+    /// Asserts that `actual` contains exactly the same asset sets as `expected`,
+    /// in any order.
+    fn assert_same_paths(actual: &[Assets], expected: &[Assets]) {
+        assert_eq!(actual.len(), expected.len());
+        for assets in expected {
+            assert!(actual.contains(assets), "missing path {:?}", assets);
+        }
+    }
+
+    #[test]
+    fn all_assets_leaves() {
+        let ms = SegwitMs::from_str(&format!("pk({})", KEY_A)).unwrap();
+        assert_eq!(ms.all_assets(10).unwrap(), vec![assets_of(&[KEY_A])]);
+
+        // A single spending path exceeds a limit of 0.
+        assert!(matches!(ms.all_assets(0), Err(Error::TooManySpendPaths)));
+
+        // `1` contributes a spending path requiring nothing; `0` has none.
+        let ms = SegwitMs::from_str(&format!("and_v(v:pk({}),1)", KEY_A)).unwrap();
+        assert_eq!(ms.all_assets(10).unwrap(), vec![assets_of(&[KEY_A])]);
+        let ms = SegwitMs::from_str(&format!("and_v(v:pk({}),0)", KEY_A)).unwrap();
+        assert!(ms.all_assets(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn all_assets_and_or() {
+        // A conjunction has a single spending path requiring everything.
+        let ms = SegwitMs::from_str(&format!("and_v(v:pk({}),pk({}))", KEY_A, KEY_B)).unwrap();
+        assert_eq!(ms.all_assets(10).unwrap(), vec![assets_of(&[KEY_A, KEY_B])]);
+
+        // A disjunction has one spending path per branch.
+        let ms = SegwitMs::from_str(&format!("or_b(pk({}),s:pk({}))", KEY_A, KEY_B)).unwrap();
+        assert_same_paths(&ms.all_assets(10).unwrap(), &[assets_of(&[KEY_A]), assets_of(&[KEY_B])]);
+    }
+
+    #[test]
+    fn all_assets_multi() {
+        let ms = SegwitMs::from_str(&format!("multi(2,{},{},{})", KEY_A, KEY_B, KEY_C)).unwrap();
+        let expected = [
+            assets_of(&[KEY_A, KEY_B]),
+            assets_of(&[KEY_A, KEY_C]),
+            assets_of(&[KEY_B, KEY_C]),
+        ];
+        assert_same_paths(&ms.all_assets(10).unwrap(), &expected);
+    }
+
+    #[test]
+    fn all_assets_thresh() {
+        let ms =
+            SegwitMs::from_str(&format!("thresh(2,pk({}),a:pk({}),a:pk({}))", KEY_A, KEY_B, KEY_C))
+                .unwrap();
+        let expected = [
+            assets_of(&[KEY_A, KEY_B]),
+            assets_of(&[KEY_A, KEY_C]),
+            assets_of(&[KEY_B, KEY_C]),
+        ];
+        assert_same_paths(&ms.all_assets(10).unwrap(), &expected);
+
+        // Nested disjunction: 2-of-{A, B|C, D} gives 5 spending paths.
+        let ms = SegwitMs::from_str(&format!(
+            "thresh(2,pk({}),a:or_b(pk({}),s:pk({})),a:pk({}))",
+            KEY_A, KEY_B, KEY_C, KEY_D
+        ))
+        .unwrap();
+        let expected = [
+            assets_of(&[KEY_A, KEY_B]),
+            assets_of(&[KEY_A, KEY_C]),
+            assets_of(&[KEY_A, KEY_D]),
+            assets_of(&[KEY_B, KEY_D]),
+            assets_of(&[KEY_C, KEY_D]),
+        ];
+        assert_same_paths(&ms.all_assets(10).unwrap(), &expected);
+    }
+
+    #[test]
+    fn all_assets_timelocks() {
+        // A path through `after` requires the timelock; it is one path, not zero.
+        let ms = SegwitMs::from_str(&format!("and_v(v:pk({}),after(10))", KEY_A)).unwrap();
+        let locktime = absolute::LockTime::from_height(10).unwrap();
+        let expected = assets_of(&[KEY_A]).after(locktime);
+        assert_eq!(ms.all_assets(10).unwrap(), vec![expected]);
+        assert!(matches!(ms.all_assets(0), Err(Error::TooManySpendPaths)));
+
+        // Same-unit timelocks on one path merge to the later one.
+        let ms =
+            SegwitMs::from_str(&format!("and_v(v:after(100),and_v(v:after(50),pk({})))", KEY_A))
+                .unwrap();
+        let expected = assets_of(&[KEY_A]).after(absolute::LockTime::from_height(100).unwrap());
+        assert_eq!(ms.all_assets(10).unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn all_assets_mixed_timelocks_impossible() {
+        // A path requiring both a height-based and a time-based `after` can
+        // never be spent; it is omitted from the result. (Such miniscripts are
+        // rejected by the default validation rules, but may be constructed with
+        // relaxed validation params.)
+        let ms = SegwitMs::from_str_with_validation_params(
+            &format!("and_v(v:pk({}),and_v(v:after(100),after(500000000)))", KEY_A),
+            &ValidationParams::MAX,
+        )
+        .unwrap();
+        assert!(ms.all_assets(10).unwrap().is_empty());
+
+        // Sibling paths of an impossible path are unaffected.
+        let ms = SegwitMs::from_str_with_validation_params(
+            &format!(
+                "or_i(pk({}),and_v(v:pk({}),and_v(v:after(100),after(500000000))))",
+                KEY_A, KEY_B
+            ),
+            &ValidationParams::MAX,
+        )
+        .unwrap();
+        assert_eq!(ms.all_assets(10).unwrap(), vec![assets_of(&[KEY_A])]);
+
+        // The limit check is conservative: the impossible path is still counted
+        // towards the limit.
+        assert!(matches!(ms.all_assets(1), Err(Error::TooManySpendPaths)));
+    }
+
+    #[test]
+    fn all_assets_limit() {
+        let keys = generate_keys(12);
+        let ms = SegwitMs::from_str(&format!("multi(7,{})", keys.join(","))).unwrap();
+
+        // 7-of-12 multisig: binom(12, 7) == 792 spending paths.
+        assert_eq!(ms.all_assets(792).unwrap().len(), 792);
+        assert!(matches!(ms.all_assets(791), Err(Error::TooManySpendPaths)));
+    }
+
+    #[test]
+    fn all_assets_huge_count_does_not_overflow() {
+        // binom(70, 35) > u64::MAX; the count must saturate and the enumeration
+        // must be rejected rather than overflow or panic.
+        let keys = generate_keys(70);
+        let ms = Miniscript::<DescriptorPublicKey, Tap>::from_str(&format!(
+            "multi_a(35,{})",
+            keys.join(",")
+        ))
+        .unwrap();
+        assert!(matches!(ms.all_assets(1_000_000), Err(Error::TooManySpendPaths)));
+    }
+
+    #[test]
+    fn all_assets_descriptor_wrappers() {
+        let desc = Descriptor::<DescriptorPublicKey>::from_str(&format!("pkh({})", KEY_A)).unwrap();
+        assert_eq!(desc.all_assets(10).unwrap(), vec![assets_of(&[KEY_A])]);
+
+        let desc =
+            Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({})", KEY_A)).unwrap();
+        assert_eq!(desc.all_assets(10).unwrap(), vec![assets_of(&[KEY_A])]);
+
+        // `sortedmulti` at every wrapper level enumerates key combinations.
+        let descs = [
+            format!("sh(sortedmulti(2,{},{},{}))", KEY_A, KEY_B, KEY_C),
+            format!("wsh(sortedmulti(2,{},{},{}))", KEY_A, KEY_B, KEY_C),
+            format!("sh(wsh(sortedmulti(2,{},{},{})))", KEY_A, KEY_B, KEY_C),
+        ];
+        for s in &descs {
+            let desc = Descriptor::<DescriptorPublicKey>::from_str(s).unwrap();
+            let expected = [
+                assets_of(&[KEY_A, KEY_B]),
+                assets_of(&[KEY_A, KEY_C]),
+                assets_of(&[KEY_B, KEY_C]),
+            ];
+            assert_same_paths(&desc.all_assets(10).unwrap(), &expected);
+        }
+    }
+
+    #[test]
+    fn all_assets_taproot() {
+        // Key-spend only descriptor: a single path with the internal key.
+        let desc =
+            Descriptor::<DescriptorPublicKey>::from_str(&format!("tr({})", KEY_XONLY)).unwrap();
+        assert_eq!(desc.all_assets(10).unwrap(), vec![assets_of(&[KEY_XONLY])]);
+
+        // The key-spend path always comes first, followed by the script paths.
+        let desc = Descriptor::<DescriptorPublicKey>::from_str(&format!(
+            "tr({},{{pk({}),multi_a(2,{},{},{})}})",
+            KEY_XONLY, KEY_B, KEY_C, KEY_D, KEY_E
+        ))
+        .unwrap();
+        let paths = desc.all_assets(10).unwrap();
+        assert_eq!(paths[0], assets_of(&[KEY_XONLY]));
+        let expected = [
+            assets_of(&[KEY_B]),
+            assets_of(&[KEY_C, KEY_D]),
+            assets_of(&[KEY_C, KEY_E]),
+            assets_of(&[KEY_D, KEY_E]),
+        ];
+        assert_same_paths(&paths[1..], &expected);
+    }
+
+    #[test]
+    fn all_assets_multipath_keys() {
+        // A BIP-389 multipath key contributes one asset entry per derivation path.
+        let desc = Descriptor::<DescriptorPublicKey>::from_str(&format!(
+            "wsh(or_b(pk([73c5da0a/84'/0'/0']xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/<0;1>/*),s:pk({})))",
+            KEY_A
+        ))
+        .unwrap();
+        let paths = desc.all_assets(10).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].keys.len(), 2); // <0;1> expands to two key sources
+        assert_eq!(paths[1], assets_of(&[KEY_A]));
+    }
+
+    #[test]
+    fn all_assets_plan_roundtrip() {
+        let sha256_hash = "0000000000000000000000000000000000000000000000000000000000000001";
+        let descs = [
+            format!("wsh(or_b(pk({}),s:pk({})))", KEY_A, KEY_B),
+            format!("wsh(and_v(v:pk({}),after(100)))", KEY_A),
+            format!("wsh(thresh(2,pk({}),a:pk({}),a:pk({})))", KEY_A, KEY_B, KEY_C),
+            format!("wsh(sha256({}))", sha256_hash),
+            format!("sh(sortedmulti(2,{},{},{}))", KEY_A, KEY_B, KEY_C),
+            format!("tr({})", KEY_XONLY),
+            format!("tr({},{{pk({}),multi_a(2,{},{},{})}})", KEY_XONLY, KEY_B, KEY_C, KEY_D, KEY_E),
+        ];
+        let expected_counts = [2, 1, 3, 1, 3, 1, 5];
+
+        for (desc_str, expected_count) in descs.iter().zip(expected_counts.iter()) {
+            let desc = Descriptor::<DescriptorPublicKey>::from_str(desc_str).unwrap();
+            let paths = desc.all_assets(1_000).unwrap();
+            assert_eq!(paths.len(), *expected_count, "{}", desc_str);
+
+            // Every enumerated asset set is sufficient to plan a spend of the
+            // corresponding definite descriptor.
+            let definite = desc.into_definite().unwrap();
+            for assets in &paths {
+                assert!(
+                    definite.clone().into_plan(assets).is_ok(),
+                    "no plan for {} with {:?}",
+                    desc_str,
+                    assets
+                );
+            }
+        }
     }
 }
