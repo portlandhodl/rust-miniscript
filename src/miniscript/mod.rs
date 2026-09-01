@@ -500,7 +500,7 @@ mod private {
                 > params.max_exec_stack_size
             {
                 return Err(ValidationError::MaxExecStackSizeExceeded {
-                    actual: sat_data.max_witness_stack_size + sat_data.max_exec_stack_count,
+                    actual: sat_data.max_witness_stack_count + sat_data.max_exec_stack_count,
                     limit: params.max_exec_stack_size,
                 });
             }
@@ -2109,6 +2109,27 @@ mod tests {
             assert_eq!(sat_data.max_exec_stack_count, 2);
         } else {
             panic!("Expected sat_data to be Some");
+        }
+    }
+
+    #[test]
+    fn test_exec_stack_size_error_reports_element_count() {
+        // Regression test: the `actual` field of MaxExecStackSizeExceeded is
+        // compared against (and reported as) a number of stack *elements*.
+        // It previously added max_witness_stack_size (a byte count) instead
+        // of max_witness_stack_count, e.g. reporting "at least 33135 items
+        // on the stack" for a script needing 1006.
+        let ms_str = "thresh(2,pk(A),s:pk(B),a:pk(C))";
+        // 3 witness stack elements, 2 execution stack elements => 5 total.
+        let params =
+            crate::ValidationParams { max_exec_stack_size: 4, ..crate::ValidationParams::MAX };
+        let res = Miniscript::<String, Segwitv0>::from_str_with_validation_params(ms_str, &params);
+        match res {
+            Err(Error::Validation(ValidationError::MaxExecStackSizeExceeded {
+                actual: 5,
+                limit: 4,
+            })) => {}
+            other => panic!("expected MaxExecStackSizeExceeded {{ actual: 5, limit: 4 }}, got {:?}", other.map(|_| ())),
         }
     }
 
