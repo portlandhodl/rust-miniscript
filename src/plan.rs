@@ -1381,7 +1381,10 @@ mod test {
             .map(|k| DefiniteDescriptorKey::new(k.clone()).unwrap())
             .collect::<Vec<_>>();
 
-        let sigs = def_keys.iter().map(|k| (k.clone(), sig)).collect::<BTreeMap<_, _>>();
+        let sigs = def_keys
+            .iter()
+            .map(|k| (k.clone(), sig))
+            .collect::<BTreeMap<_, _>>();
         let pkh_sigs = def_keys
             .iter()
             .map(|k| (k.to_pubkeyhash(SigType::Ecdsa), (k.clone(), sig)))
