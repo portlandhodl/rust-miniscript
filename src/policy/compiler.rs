@@ -12,7 +12,7 @@ use std::error;
 
 use sync::Arc;
 
-use crate::miniscript::context::SigType;
+use crate::miniscript::context::{ScriptContextError, SigType};
 use crate::miniscript::limits::{MAX_PUBKEYS_IN_CHECKSIGADD, MAX_PUBKEYS_PER_MULTISIG};
 use crate::miniscript::types::{self, ErrorKind, Type};
 use crate::miniscript::ScriptContext;
@@ -25,7 +25,7 @@ type PolicyCache<Pk, Ctx> = BTreeMap<
     BTreeMap<CompilationKey, AstElemExt<Pk, Ctx>>,
 >;
 /// Detailed error type for compiler.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum CompilerError {
     /// `And` fragments only support two args.
     NonBinaryArgAnd,
@@ -43,6 +43,9 @@ pub enum CompilerError {
     /// In a Taproot compilation, no "unspendable key" was provided and no in-policy
     /// key could be used as an internal key.
     NoInternalKey,
+    /// A policy key is not valid under the selected script context (e.g. an
+    /// x-only key in Segwit v0 or an uncompressed key in Taproot).
+    ContextError(ScriptContextError),
     /// The selected Taproot internal key is uncompressed.
     UncompressedTaprootInternalKey,
     /// A Huffman merge during Taproot compilation would place a leaf beyond
@@ -79,6 +82,7 @@ impl fmt::Display for CompilerError {
                 "At least one spending path has exceeded the standardness or consensus limits",
             ),
             Self::NoInternalKey => f.write_str("Taproot compilation had no internal key available"),
+            Self::ContextError(ref e) => fmt::Display::fmt(e, f),
             Self::UncompressedTaprootInternalKey => {
                 f.write_str("Taproot compilation selected an uncompressed internal key")
             }
@@ -254,6 +258,7 @@ impl error::Error for CompilerError {
             | TooManyTapleaves { .. }
             | IfFragmentInNativeLeaf { .. } => None,
             PolicyError(e) => Some(e),
+            ContextError(e) => Some(e),
         }
     }
 }
@@ -944,6 +949,10 @@ where
             insert_wrap!(AstElemExt::trivial());
         }
         Concrete::Key(ref pk) => {
+            // The compiler must never produce a Miniscript that is invalid
+            // under the target script context (e.g. an x-only key in Segwit
+            // v0, or an uncompressed key in Taproot).
+            Ctx::check_pk(pk).map_err(CompilerError::ContextError)?;
             insert_wrap!(AstElemExt::pk_h(pk.clone()));
             insert_wrap!(AstElemExt::pk_k(pk.clone()));
         }
