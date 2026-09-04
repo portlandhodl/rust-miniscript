@@ -49,6 +49,19 @@ pub(crate) fn witness_size<T: ItemSize>(wit: &[T]) -> usize {
     wit.iter().map(T::size).sum::<usize>() + varint_len(wit.len())
 }
 
+// Helper function to calculate the size of a witness template serialized as
+// legacy scriptSig pushes, without the script-length varint prefix: items
+// become minimal pushes, so the single-byte constants OP_0/OP_1 take one byte.
+pub(crate) fn script_pushes_len<Pk: MiniscriptKey>(template: &[Placeholder<Pk>]) -> usize {
+    template
+        .iter()
+        .map(|item| match item {
+            Placeholder::PushOne => 1, // OP_1
+            _ => item.size(),
+        })
+        .sum()
+}
+
 pub(crate) fn witness_to_scriptsig(witness: &[Vec<u8>]) -> ScriptBuf {
     let mut b = script::Builder::new();
     for (i, wit) in witness.iter().enumerate() {

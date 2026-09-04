@@ -20,7 +20,6 @@ use core::iter::FromIterator;
 
 use bitcoin::hashes::{hash160, ripemd160, sha256};
 use bitcoin::key::XOnlyPublicKey;
-use bitcoin::script::PushBytesBuf;
 use bitcoin::taproot::{ControlBlock, LeafVersion, TapLeafHash};
 use bitcoin::{absolute, bip32, psbt, relative, ScriptBuf, WitnessVersion};
 
@@ -28,8 +27,10 @@ use crate::descriptor::{self, Descriptor, DescriptorType, KeyMap};
 use crate::miniscript::hash256;
 use crate::miniscript::satisfy::{Placeholder, Satisfier, SchnorrSigType};
 use crate::prelude::*;
-use crate::util::{varint_len, witness_size};
-use crate::{DefiniteDescriptorKey, DescriptorPublicKey, Error, MiniscriptKey, ToPublicKey};
+use crate::util::{script_pushes_len, varint_len, witness_size, witness_to_scriptsig};
+use crate::{
+    push_opcode_size, DefiniteDescriptorKey, DescriptorPublicKey, Error, MiniscriptKey, ToPublicKey,
+};
 
 /// Trait describing a present/missing lookup table for constructing witness templates
 ///
@@ -238,8 +239,23 @@ impl<Pk: MiniscriptKey + ToPublicKey> Plan<Pk> {
     /// var-int prefix.
     pub fn scriptsig_size(&self) -> usize {
         match (self.descriptor.desc_type().segwit_version(), self.descriptor.desc_type()) {
+            // The satisfaction pushes and the redeem script push all go in the
+            // script_sig, which is prefixed with a varint of its total length.
+            (None, DescriptorType::Sh) => {
+                let script_len = self
+                    .descriptor
+                    .explicit_script()
+                    .expect("sh descriptors have explicit script")
+                    .len();
+                let content_len =
+                    script_pushes_len(&self.template) + push_opcode_size(script_len) + script_len;
+                varint_len(content_len) + content_len
+            }
             // Entire witness goes in the script_sig
-            (None, _) => witness_size(self.template.as_ref()),
+            (None, _) => {
+                let content_len = script_pushes_len(&self.template);
+                varint_len(content_len) + content_len
+            }
             // Taproot doesn't have a "wrapped" version (scriptSig len (1))
             (Some(WitnessVersion::V1), _) => 1,
             // scriptSig len (1) + OP_PUSHBYTES_22 (1) + OP_0 (1) + OP_PUSHBYTES_20 (1) + <pk hash> (20)
@@ -281,8 +297,6 @@ impl<Pk: MiniscriptKey + ToPublicKey> Plan<Pk> {
         &self,
         stfr: &Sat,
     ) -> Result<(Vec<Vec<u8>>, ScriptBuf), Error> {
-        use bitcoin::blockdata::script::Builder;
-
         let stack = self
             .template
             .iter()
@@ -291,17 +305,16 @@ impl<Pk: MiniscriptKey + ToPublicKey> Plan<Pk> {
             .ok_or(Error::CouldNotSatisfy)?;
 
         Ok(match self.descriptor.desc_type() {
-            DescriptorType::Bare | DescriptorType::Sh | DescriptorType::Pkh => (
-                vec![],
-                stack
-                    .into_iter()
-                    .fold(Builder::new(), |builder, item| {
-                        let bytes = PushBytesBuf::try_from(item)
-                            .expect("All the possible placeholders can be made into PushBytesBuf");
-                        builder.push_slice(bytes)
-                    })
-                    .into_script(),
-            ),
+            DescriptorType::Bare | DescriptorType::Pkh => (vec![], witness_to_scriptsig(&stack)),
+            DescriptorType::Sh => {
+                let mut stack = stack;
+                let redeem_script = self
+                    .descriptor
+                    .explicit_script()
+                    .expect("sh descriptors have explicit script");
+                stack.push(redeem_script.into_bytes());
+                (vec![], witness_to_scriptsig(&stack))
+            }
             DescriptorType::Wpkh | DescriptorType::Tr => (stack, ScriptBuf::new()),
             DescriptorType::ShWpkh => (stack, self.descriptor.unsigned_script_sig()),
             DescriptorType::Wsh | DescriptorType::ShWsh => {
@@ -1409,6 +1422,67 @@ mod test {
             assert_eq!(plan.witness_size(), bitcoin::consensus::serialize(&witness).len());
             assert_eq!(plan.scriptsig_size(), varint_len(script_sig.len()) + script_sig.len());
             assert_eq!(plan.satisfaction_weight(), max_weight + 4 + 1);
+        }
+    }
+
+    /// Legacy plans put the whole satisfaction in the scriptSig, including the
+    /// redeem script push for P2SH-wrapped miniscript, so they can be checked
+    /// byte for byte against the descriptor's own satisfaction machinery.
+    #[test]
+    fn sizes_match_legacy_satisfaction() {
+        let secp = Secp256k1::new();
+        let keys = (1u8..=8)
+            .map(|i| {
+                let sk = secp256k1::SecretKey::from_slice(&[i; 32]).unwrap();
+                bitcoin::PublicKey::new(secp256k1::PublicKey::from_secret_key(&secp, &sk))
+            })
+            .collect::<Vec<_>>();
+
+        // A 72-byte signature, as in `sizes_match_max_sig_satisfaction`, so the
+        // plan's 73-byte budget is exact.
+        let mut raw = [0x01u8; 64];
+        raw[0] = 0x80;
+        let sig = bitcoin::ecdsa::Signature::sighash_all(
+            secp256k1::ecdsa::Signature::from_compact(&raw).unwrap(),
+        );
+
+        let satisfier = keys
+            .iter()
+            .map(|k| (DefiniteDescriptorKey::from_str(&k.to_string()).unwrap(), sig))
+            .collect::<BTreeMap<_, _>>();
+        let assets = keys.iter().fold(Assets::new(), |assets, k| {
+            assets.add(DescriptorPublicKey::from_str(&k.to_string()).unwrap())
+        });
+
+        for desc_str in [
+            // Baselines: one-byte push opcodes and length prefixes throughout.
+            format!("pkh({})", keys[0]),
+            format!("sh(and_v(v:pk({}),pk({})))", keys[0], keys[1]),
+            // 105-byte redeem script: OP_PUSHDATA1. 254-byte scriptSig: 3-byte varint.
+            format!("sh(sortedmulti(2,{},{},{}))", keys[0], keys[1], keys[2]),
+            // 275-byte redeem script: OP_PUSHDATA2.
+            format!(
+                "sh(sortedmulti(5,{},{},{},{},{},{},{},{}))",
+                keys[0], keys[1], keys[2], keys[3], keys[4], keys[5], keys[6], keys[7]
+            ),
+        ] {
+            let desc = Descriptor::<DefiniteDescriptorKey>::from_str(&desc_str).unwrap();
+            let max_weight = desc.max_weight_to_satisfy().unwrap().to_wu() as usize;
+            let (_witness, expected) = desc.get_satisfaction(&satisfier).unwrap();
+
+            let plan = desc.clone().into_plan(&assets).unwrap();
+            let (witness, script_sig) = plan.satisfy(&satisfier).unwrap();
+
+            assert!(witness.is_empty());
+            assert_eq!(script_sig, expected);
+            assert_eq!(plan.witness_size(), 0);
+            assert_eq!(plan.scriptsig_size(), varint_len(script_sig.len()) + script_sig.len());
+
+            // `max_weight_to_satisfy` is the weight that satisfying adds to an
+            // input, so it leaves out the scriptSig length byte (4 WU) that an
+            // unsatisfied input carries too. There is no witness count byte for
+            // legacy inputs. The plan reports the absolute size.
+            assert_eq!(plan.satisfaction_weight(), max_weight + 4);
         }
     }
 }
