@@ -28,7 +28,7 @@ use crate::descriptor::{self, Descriptor, DescriptorType, KeyMap};
 use crate::miniscript::hash256;
 use crate::miniscript::satisfy::{Placeholder, Satisfier, SchnorrSigType};
 use crate::prelude::*;
-use crate::util::witness_size;
+use crate::util::{varint_len, witness_size};
 use crate::{DefiniteDescriptorKey, DescriptorPublicKey, Error, MiniscriptKey, ToPublicKey};
 
 /// Trait describing a present/missing lookup table for constructing witness templates
@@ -257,7 +257,20 @@ impl<Pk: MiniscriptKey + ToPublicKey> Plan<Pk> {
     /// if there's at least one segwit input in the tx. See ["Empty script witnesses are encoded as a zero byte"](https://github.com/bitcoin/bips/blob/d8a56c9f2b521bf4af5d588f217e7618cc44952c/bip-0144.mediawiki#serialization).
     pub fn witness_size(&self) -> usize {
         if self.descriptor.desc_type().segwit_version().is_some() {
-            witness_size(self.template.as_ref())
+            let template_size = witness_size(self.template.as_ref());
+            match self.descriptor.desc_type() {
+                DescriptorType::Wsh | DescriptorType::ShWsh => {
+                    let script_len = self
+                        .descriptor
+                        .explicit_script()
+                        .expect("wsh descriptors have explicit script")
+                        .len();
+                    template_size + varint_len(script_len) + script_len
+                        - varint_len(self.template.len())
+                        + varint_len(self.template.len() + 1)
+                }
+                _ => template_size,
+            }
         } else {
             0
         }
@@ -792,10 +805,11 @@ mod test {
         let desc = format!("wsh(t:or_c(pk({}),v:pkh({})))", keys[0], keys[1]);
 
         // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig)
+        // + 1 (witness script len) + 63 (witness script)
         let tests = vec![
             (vec![], vec![], None, None, None),
-            (vec![0], vec![], None, None, Some(4 + 1 + 73)),
-            (vec![0, 1], vec![], None, None, Some(4 + 1 + 73)),
+            (vec![0], vec![], None, None, Some(4 + 1 + 73 + 1 + 63)),
+            (vec![0, 1], vec![], None, None, Some(4 + 1 + 73 + 1 + 63)),
         ];
 
         test_inner(&desc, keys, hashes, tests);
@@ -817,10 +831,11 @@ mod test {
         let desc = format!("wsh(and_v(v:pk({}),pk({})))", keys[0], keys[1]);
 
         // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 2
+        // + 1 (witness script len) + 70 (witness script)
         let tests = vec![
             (vec![], vec![], None, None, None),
             (vec![0], vec![], None, None, None),
-            (vec![0, 1], vec![], None, None, Some(4 + 1 + 73 * 2)),
+            (vec![0, 1], vec![], None, None, Some(4 + 1 + 73 * 2 + 1 + 70)),
         ];
 
         test_inner(&desc, keys, hashes, tests);
@@ -853,7 +868,8 @@ mod test {
             (vec![], vec![], None, None, None),
             (vec![0, 1], vec![], None, None, None),
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 3 + 1 (dummy push)
-            (vec![0, 1, 3], vec![], None, None, Some(4 + 1 + 73 * 3 + 1)),
+            // + 1 (witness script len) + 139 (witness script)
+            (vec![0, 1, 3], vec![], None, None, Some(4 + 1 + 73 * 3 + 1 + 1 + 139)),
         ];
 
         test_inner(&desc, keys, hashes, tests);
@@ -887,24 +903,28 @@ mod test {
             ),
             (vec![0], vec![], None, None, None),
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) + 1 (OP_0) + 1 (OP_ZERO)
+            // + 1 (witness script len) + 85 (witness script)
             (
                 vec![0],
                 vec![],
                 Some(Sequence(1000).to_relative_lock_time().unwrap()),
                 None,
-                Some(80),
+                Some(166),
             ),
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 2 + 2 (OP_PUSHBYTE_1 0x01)
-            (vec![0, 1], vec![], None, None, Some(153)),
+            // + 1 (witness script len) + 85 (witness script)
+            (vec![0, 1], vec![], None, None, Some(239)),
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) + 1 (OP_0) + 1 (OP_ZERO)
+            // + 1 (witness script len) + 85 (witness script)
             (
                 vec![0, 1],
                 vec![],
                 Some(Sequence(1000).to_relative_lock_time().unwrap()),
                 None,
-                Some(80),
+                Some(166),
             ),
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 2 + 2 (OP_PUSHBYTE_1 0x01)
+            // + 1 (witness script len) + 85 (witness script)
             (
                 vec![0, 1],
                 vec![],
@@ -914,7 +934,7 @@ mod test {
                         .unwrap(),
                 ),
                 None,
-                Some(153),
+                Some(239),
             ), // incompatible timelock
         ];
 
@@ -924,20 +944,22 @@ mod test {
 
         let tests = vec![
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) + 1 (OP_0) + 1 (OP_ZERO)
+            // + 1 (witness script len) + 85 (witness script)
             (
                 vec![0],
                 vec![],
                 None,
                 Some(absolute::LockTime::from_height(1000).unwrap()),
-                Some(80),
+                Some(166),
             ),
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 2 + 2 (OP_PUSHBYTE_1 0x01)
+            // + 1 (witness script len) + 85 (witness script)
             (
                 vec![0, 1],
                 vec![],
                 None,
                 Some(absolute::LockTime::from_time(500_001_000).unwrap()),
-                Some(153),
+                Some(239),
             ), // incompatible timelock
         ];
 
@@ -1081,7 +1103,8 @@ mod test {
             (vec![], vec![0], None, None, None),
             // Key + hash
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) + 1 (OP_PUSH) + 32 (preimage)
-            (vec![0], vec![0], None, None, Some(111)),
+            // + 1 (witness script len) + 62 (witness script)
+            (vec![0], vec![0], None, None, Some(174)),
         ];
 
         test_inner(&desc, keys, hashes, tests);
