@@ -242,10 +242,10 @@ impl<Pk: MiniscriptKey + ToPublicKey> Plan<Pk> {
             (None, _) => witness_size(self.template.as_ref()),
             // Taproot doesn't have a "wrapped" version (scriptSig len (1))
             (Some(WitnessVersion::V1), _) => 1,
-            // scriptSig len (1) + OP_0 (1) + OP_PUSHBYTES_20 (1) + <pk hash> (20)
-            (_, DescriptorType::ShWpkh) => 1 + 1 + 1 + 20,
-            // scriptSig len (1) + OP_0 (1) + OP_PUSHBYTES_32 (1) + <script hash> (32)
-            (_, DescriptorType::ShWsh) => 1 + 1 + 1 + 32,
+            // scriptSig len (1) + OP_PUSHBYTES_22 (1) + OP_0 (1) + OP_PUSHBYTES_20 (1) + <pk hash> (20)
+            (_, DescriptorType::ShWpkh) => 1 + 1 + 1 + 1 + 20,
+            // scriptSig len (1) + OP_PUSHBYTES_34 (1) + OP_0 (1) + OP_PUSHBYTES_32 (1) + <script hash> (32)
+            (_, DescriptorType::ShWsh) => 1 + 1 + 1 + 1 + 32,
             // Native Segwit v0 (scriptSig len (1))
             _ => 1,
         }
