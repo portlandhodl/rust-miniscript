@@ -1193,7 +1193,7 @@ mod tests {
     use bitcoin::hashes;
 
     use super::*;
-    use crate::miniscript::{Legacy, Segwitv0, Tap};
+    use crate::miniscript::{BareCtx, Legacy, Segwitv0, Tap};
     use crate::policy::Liftable;
     use crate::{script_num_size, AbsLockTime, RelLockTime, Threshold, ToPublicKey};
 
@@ -1636,5 +1636,42 @@ mod tests {
         );
 
         assert_eq!(miniscript, expected);
+    }
+
+    #[test]
+    fn context_invalid_keys() {
+        // X-only keys are not allowed in Segwitv0, Legacy or Bare contexts;
+        // the compiler must return an error rather than produce an invalid
+        // Miniscript.
+        let x_only_key = "08c0fcf8895f4361b4fc77afe2ad53b0bd27dcebfd863421b2b246dc283d4103";
+        let policy: Concrete<bitcoin::XOnlyPublicKey> = policy_str!("pk({})", x_only_key);
+        assert_eq!(
+            policy.compile::<Segwitv0>(),
+            Err(CompilerError::ContextError(ScriptContextError::XOnlyKeysNotAllowed(
+                x_only_key.to_string(),
+                "Segwitv0"
+            ))),
+        );
+        policy.compile::<Legacy>().unwrap_err();
+        policy.compile::<BareCtx>().unwrap_err();
+        // ..but they are allowed in a Taproot context.
+        policy.compile::<Tap>().unwrap();
+
+        // The same restriction applies to keys compiled into multi fragments.
+        let k2 = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let multi_pol: Concrete<bitcoin::XOnlyPublicKey> =
+            policy_str!("thresh(1,pk({}),pk({}))", x_only_key, k2);
+        multi_pol.compile::<Segwitv0>().unwrap_err();
+
+        // Uncompressed keys are not allowed in Segwitv0 or Taproot contexts.
+        let uncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+        let policy: Concrete<bitcoin::PublicKey> = policy_str!("pk({})", uncompressed);
+        assert_eq!(
+            policy.compile::<Segwitv0>(),
+            Err(CompilerError::ContextError(ScriptContextError::UncompressedKeysNotAllowed)),
+        );
+        policy.compile::<Tap>().unwrap_err();
+        // ..but they are allowed in a Legacy context.
+        policy.compile::<Legacy>().unwrap();
     }
 }
