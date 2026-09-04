@@ -1283,4 +1283,69 @@ mod test {
 
         assert!(desc.into_plan(&assets).is_err());
     }
+
+    /// A [`Satisfier`] that knows hash preimages only.
+    ///
+    /// A plan sizes a signature at its 73-byte maximum while a real one varies
+    /// in length, so a spend path that carries no signature is the one whose
+    /// witness has a size a plan can be held to byte for byte.
+    struct Preimages(BTreeMap<sha256::Hash, [u8; 32]>);
+
+    impl Satisfier<DefiniteDescriptorKey> for Preimages {
+        fn lookup_sha256(&self, h: &sha256::Hash) -> Option<[u8; 32]> { self.0.get(h).copied() }
+    }
+
+    #[test]
+    fn sizes_match_satisfaction() {
+        use bitcoin::hashes::Hash as _;
+
+        let preimages = [[1u8; 32], [2u8; 32]];
+        let hashes = preimages.map(|p| sha256::Hash::hash(&p));
+        let satisfier = Preimages(hashes.iter().copied().zip(preimages).collect());
+        let assets = Assets::new().add(hashes[0]).add(hashes[1]);
+
+        // Sigless, so it has to go around the sanity checks of `from_str`.
+        let ms = Miniscript::<DefiniteDescriptorKey, Segwitv0>::from_str_insane(&format!(
+            "and_v(v:sha256({}),sha256({}))",
+            hashes[0], hashes[1]
+        ))
+        .unwrap();
+
+        for desc in [
+            Descriptor::new_wsh(ms.clone()).unwrap(),
+            Descriptor::new_sh_wsh(ms).unwrap(),
+        ] {
+            let max_weight = desc.max_weight_to_satisfy().unwrap().to_wu() as usize;
+            let plan = desc.into_plan(&assets).unwrap();
+            let (witness, script_sig) = plan.satisfy(&satisfier).unwrap();
+
+            // The witness as it goes on the wire: an element count followed by
+            // length-prefixed elements, the witness script among them.
+            let witness = bitcoin::Witness::from_slice(&witness);
+            assert_eq!(plan.witness_size(), bitcoin::consensus::serialize(&witness).len());
+            assert_eq!(plan.scriptsig_size(), varint_len(script_sig.len()) + script_sig.len());
+
+            // `max_weight_to_satisfy` is the weight that satisfying adds to an
+            // input, so it leaves out the scriptSig length byte (4 WU) and the
+            // witness count byte (1 WU) that an unsatisfied input carries too.
+            // The plan reports the absolute size, so it is larger by exactly those.
+            assert_eq!(plan.satisfaction_weight(), max_weight + 4 + 1);
+        }
+
+        // sh(wpkh) needs a signature, whose real size varies, so only what a plan
+        // can be held to exactly is checked: the scriptSig it returns, and the
+        // relation to `max_weight_to_satisfy`, which sizes a signature the way the
+        // plan does.
+        let key = DescriptorPublicKey::from_str(
+            "02c2fd50ceae468857bb7eb32ae9cd4083e6c7e42fbbec179d81134b3e3830586c",
+        )
+        .unwrap();
+        let desc =
+            Descriptor::<DefiniteDescriptorKey>::from_str(&format!("sh(wpkh({}))", key)).unwrap();
+        let max_weight = desc.max_weight_to_satisfy().unwrap().to_wu() as usize;
+        let script_sig = desc.unsigned_script_sig();
+        let plan = desc.into_plan(&Assets::new().add(key)).unwrap();
+        assert_eq!(plan.scriptsig_size(), varint_len(script_sig.len()) + script_sig.len());
+        assert_eq!(plan.satisfaction_weight(), max_weight + 4 + 1);
+    }
 }
