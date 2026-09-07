@@ -488,6 +488,9 @@ pub enum Error {
     Parse(ParseError),
     /// Validation of a script failed.
     Validation(ValidationError),
+    /// The descriptor or miniscript has more spending paths than the
+    /// caller-provided limit.
+    TooManySpendPaths,
 }
 
 #[doc(hidden)] // will be removed when we remove Error
@@ -542,6 +545,8 @@ impl fmt::Display for Error {
             Self::ParseThreshold(ref e) => e.fmt(f),
             Self::Parse(ref e) => e.fmt(f),
             Self::Validation(ref e) => e.fmt(f),
+            Self::TooManySpendPaths =>
+                f.write_str("more spending paths than the provided limit"),
         }
     }
 }
@@ -564,7 +569,8 @@ impl std::error::Error for Error {
             | ImpossibleSatisfaction
             | BareDescriptorAddr
             | TrNoScriptCode
-            | MultipathDescLenMismatch => None,
+            | MultipathDescLenMismatch
+            | TooManySpendPaths => None,
             ScriptLexer(e) => Some(e),
             AddrError(e) => Some(e),
             AddrP2shError(e) => Some(e),
