@@ -369,7 +369,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Satisfaction<Placeholder<Pk>> {
                 }
                 Terminal::NonZero(_) => {
                     let SatDissat { sat: sub, .. } = stack.pop().unwrap();
-                    SatDissat { dissat: Self::IMPOSSIBLE, sat: sub }
+                    SatDissat { dissat: Self::push_0(), sat: sub }
                 }
                 Terminal::AndB(_, _) => {
                     let SatDissat { dissat: r_dis, sat: r_sat } = stack.pop().unwrap();
