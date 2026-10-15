@@ -1405,4 +1405,39 @@ mod tests {
             Some(absolute::LockTime::from_time(1_000_000_000).unwrap()),
         );
     }
+
+    /// The dissatisfaction of `j:` (`NonZero`) is a single empty push, not
+    /// `Witness::Impossible`. Test with a compiler-emitted `j:` wrapper.
+    #[cfg(feature = "compiler")]
+    #[test]
+    fn regression_nonzero_dissat() {
+        use crate::policy::Concrete;
+
+        let key_a: PublicKey = "02eb64639a17f7334bb5a1a3aad857d6fec65faef439db3de72f85c88bc2906ad1"
+            .parse()
+            .unwrap();
+        let key_b: PublicKey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            .parse()
+            .unwrap();
+        let sig_a = bitcoin::ecdsa::Signature::sighash_all(
+            secp256k1::ecdsa::Signature::from_compact(&[1; 64]).unwrap(),
+        );
+        let sig_b = bitcoin::ecdsa::Signature::sighash_all(
+            secp256k1::ecdsa::Signature::from_compact(&[2; 64]).unwrap(),
+        );
+        let mut signatures = std::collections::BTreeMap::new();
+        signatures.insert(key_a, sig_a);
+        signatures.insert(key_b, sig_b);
+
+        let sha256_hash = "1111111111111111111111111111111111111111111111111111111111111111";
+        let policy = Concrete::<PublicKey>::from_str(&format!(
+            "thresh(2,pk({key_a}),pk({key_b}),and(sha256({sha256_hash}),older(1)))",
+        ))
+        .unwrap();
+        let ms = policy.compile::<Segwitv0>().unwrap();
+
+        assert!(ms.to_string().contains("j:"), "unexpected compiler output: {ms}");
+        let witness = ms.satisfy(&signatures).unwrap();
+        assert_eq!(witness, vec![vec![], sig_b.to_vec(), sig_a.to_vec()]);
+    }
 }
