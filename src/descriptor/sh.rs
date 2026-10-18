@@ -89,6 +89,10 @@ impl<Pk: FromStrKey> crate::expression::FromTree for Sh<Pk> {
             _ => {
                 let sub = Miniscript::from_tree(top)?;
                 Legacy::top_level_checks(&sub)?;
+                // Enforce the same sanity rules as parsing a Miniscript directly:
+                // reject non-B top-level fragments, sigless branches, duplicate
+                // keys, malleable constructions and raw pubkey hashes.
+                sub.validate(&Legacy::SANE).map_err(Error::Validation)?;
                 ShInner::Ms(sub)
             }
         };

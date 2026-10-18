@@ -1258,13 +1258,26 @@ mod tests {
         // in terms of the in-memory representation -- OrI(False, False).
         // Test that the way we display the ambiguous fragment doesn't
         // change, in case somebody somehow is depending on it.
-        let desc = StdDescriptor::from_str("sh(u:0)").unwrap();
-        assert_eq!("sh(u:0)#ncq3yf9h", desc.to_string());
+        //
+        // Note that these scripts are insane (sigless branches), so they
+        // cannot be obtained from parsing a descriptor string anymore:
+        // descriptor parsing enforces the same sanity checks as miniscript
+        // parsing. We therefore assert the display behavior directly on the
+        // miniscript, which is the only remaining way to construct them.
+        let params = crate::ValidationParams { allow_or_i: true, ..crate::Legacy::CONSENSUS };
+        let ms =
+            Miniscript::<PublicKey, crate::Legacy>::from_str_with_validation_params("u:0", &params)
+                .unwrap();
+        assert_eq!(ms.to_string(), "u:0");
 
         // This is a regression test for https://github.com/rust-bitcoin/rust-miniscript/pull/735
         // which was found at the same time. It's just a bug plain and simple.
-        let desc = StdDescriptor::from_str("sh(and_n(u:0,1))").unwrap();
-        assert_eq!("sh(and_n(u:0,1))#5j5tw8nm", desc.to_string());
+        let ms = Miniscript::<PublicKey, crate::Legacy>::from_str_with_validation_params(
+            "and_n(u:0,1)",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(ms.to_string(), "and_n(u:0,1)");
     }
 
     #[test]
@@ -1652,7 +1665,12 @@ mod tests {
 
     #[test]
     fn after_is_cltv() {
-        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str("wsh(after(1000))").unwrap();
+        // Note: `wsh(after(1000))` would be the minimal spelling here but is
+        // (correctly) refused as insane since it has a sigless branch.
+        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str(
+            "wsh(and_v(v:pk(020000000000000000000000000000000000000000000000000000000000000002),after(1000)))",
+        )
+        .unwrap();
         let script = descriptor.explicit_script().unwrap();
 
         let actual_instructions: Vec<_> = script.instructions().collect();
@@ -1663,7 +1681,12 @@ mod tests {
 
     #[test]
     fn older_is_csv() {
-        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str("wsh(older(1000))").unwrap();
+        // Note: `wsh(older(1000))` would be the minimal spelling here but is
+        // (correctly) refused as insane since it has a sigless branch.
+        let descriptor = Descriptor::<bitcoin::PublicKey>::from_str(
+            "wsh(and_v(v:pk(020000000000000000000000000000000000000000000000000000000000000002),older(1000)))",
+        )
+        .unwrap();
         let script = descriptor.explicit_script().unwrap();
 
         let actual_instructions: Vec<_> = script.instructions().collect();
@@ -2256,17 +2279,48 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
             "sh(wpkh(020000000000000000000000000000000000000000000000000000000000000002))",
         );
 
-        let wsh = StdDescriptor::from_str("wsh(1)").unwrap();
-        assert_eq!(format!("{}", wsh), "wsh(1)#mrg7xj7p");
-        assert_eq!(format!("{:#}", wsh), "wsh(1)");
+        // Note: `wsh(1)`, `sh(1)` and `sh(wsh(1))` (as earlier versions of this
+        // test used) are invalid descriptors, since descriptor parsing enforces
+        // sanity checks and bare `1` is a sigless fragment. Also note that
+        // `c:pk_k` displays in normalized form (`pk`).
+        let wsh = StdDescriptor::from_str(
+            "wsh(c:pk_k(020000000000000000000000000000000000000000000000000000000000000002))",
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{}", wsh),
+            "wsh(pk(020000000000000000000000000000000000000000000000000000000000000002))#5nwwmlxd"
+        );
+        assert_eq!(
+            format!("{:#}", wsh),
+            "wsh(pk(020000000000000000000000000000000000000000000000000000000000000002))"
+        );
 
-        let sh = StdDescriptor::from_str("sh(1)").unwrap();
-        assert_eq!(format!("{}", sh), "sh(1)#l8r75ggs");
-        assert_eq!(format!("{:#}", sh), "sh(1)");
+        let sh = StdDescriptor::from_str(
+            "sh(c:pk_k(020000000000000000000000000000000000000000000000000000000000000002))",
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{}", sh),
+            "sh(pk(020000000000000000000000000000000000000000000000000000000000000002))#5h4uw55c"
+        );
+        assert_eq!(
+            format!("{:#}", sh),
+            "sh(pk(020000000000000000000000000000000000000000000000000000000000000002))"
+        );
 
-        let shwsh = StdDescriptor::from_str("sh(wsh(1))").unwrap();
-        assert_eq!(format!("{}", shwsh), "sh(wsh(1))#hcyfl07f");
-        assert_eq!(format!("{:#}", shwsh), "sh(wsh(1))");
+        let shwsh = StdDescriptor::from_str(
+            "sh(wsh(c:pk_k(020000000000000000000000000000000000000000000000000000000000000002)))",
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{}", shwsh),
+            "sh(wsh(pk(020000000000000000000000000000000000000000000000000000000000000002)))#zznkegd3"
+        );
+        assert_eq!(
+            format!("{:#}", shwsh),
+            "sh(wsh(pk(020000000000000000000000000000000000000000000000000000000000000002)))"
+        );
 
         let tr = StdDescriptor::from_str(
             "tr(020000000000000000000000000000000000000000000000000000000000000002)",
@@ -2321,18 +2375,71 @@ pk(03f28773c2d975288bc7d1d205c3748651b075fbc6610e58cddeeddf8f19405aa8))";
 
     #[test]
     fn regression_734() {
+        // Issue 734 is resolved: descriptor parsing now enforces sanity checks,
+        // so signatureless-fragment descriptors are rejected everywhere.
         Descriptor::<DescriptorPublicKey>::from_str(
             "wsh(or_i(pk(0202baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0a66a),1))",
         )
-        .unwrap();
+        .unwrap_err();
         Descriptor::<DescriptorPublicKey>::from_str(
             "sh(or_i(pk(0202baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0a66a),1))",
         )
-        .unwrap();
+        .unwrap_err();
         Descriptor::<DescriptorPublicKey>::from_str(
             "tr(02baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0a66a,1)",
         )
         .unwrap_err();
+    }
+
+    #[test]
+    fn descriptor_parse_requires_sane_miniscript() {
+        // Reject non-B top-level fragments, sigless branches, and raw pubkey
+        // hashes in every descriptor context. See issues #734, #788, #1067.
+        let key = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let hash160 = "9".repeat(40);
+
+        for bad in [
+            format!("wsh(pk_k({key}))"),                // type K at top level
+            format!("wsh(pk_h({key}))"),                // type K at top level
+            "wsh(1)".to_owned(),                        // sigless, anyone-can-spend
+            "sh(1)".to_owned(),                         // sigless, anyone-can-spend
+            "sh(wsh(1))".to_owned(),                    // nested sanity via sh(wsh(..))
+            format!("wsh(v:pk({key}))"),                // issue #1067: type V at top level
+            format!("sh(wsh(v:pk({key})))"),            // issue #1067
+            format!("sh(v:pk({key}))"),                 // issue #1067
+            format!("wsh(or_d(pk({key}),older(144)))"), // sigless branch
+            format!("sh(or_i(pk({key}),1))"),           // sigless branch (issue #734)
+            format!("wsh(c:expr_raw_pkh({hash160}))"),  // raw pubkey hash
+            format!("sh(c:expr_raw_pkh({hash160}))"),   // raw pubkey hash
+            format!("bare(pk_k({key}))"),               // bare top-level type K
+            "bare(1)".to_owned(),                       // bare sigless
+        ] {
+            assert!(
+                Descriptor::<DescriptorPublicKey>::from_str(&bad).is_err(),
+                "descriptor {bad} should fail sanity checks"
+            );
+        }
+
+        // Duplicate keys in a multisig are also insane (issue #788).
+        let dup = format!("wsh(multi(2,{key},{key}))");
+        assert!(Descriptor::<DescriptorPublicKey>::from_str(&dup).is_err());
+
+        // The equivalent sane forms still parse (positive control). Note that
+        // `and_v(v:pk(K),1)` is legitimately sane: `and_v` of (V, B) is type B
+        // and `v:pk` gates it behind a signature.
+        let key2 = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        for good in [
+            format!("wsh(pk({key}))"),
+            format!("sh(sortedmulti(1,{key},{key2}))"),
+            format!("wsh(and_v(v:pk({key}),after(144)))"),
+            format!("wsh(and_v(v:pk({key}),older(144)))"),
+            format!("wsh(and_v(v:pk({key}),1))"),
+        ] {
+            assert!(
+                Descriptor::<DescriptorPublicKey>::from_str(&good).is_ok(),
+                "sane descriptor {good} should parse"
+            );
+        }
     }
 
     #[test]

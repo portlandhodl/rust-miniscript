@@ -190,6 +190,10 @@ impl<Pk: FromStrKey> crate::expression::FromTree for Wsh<Pk> {
 
         let sub = Miniscript::from_tree(top)?;
         Segwitv0::top_level_checks(&sub)?;
+        // Enforce the same sanity rules as parsing a Miniscript directly:
+        // reject non-B top-level fragments, sigless branches, duplicate keys,
+        // malleable constructions and raw pubkey hashes (see #734, #788, #1067).
+        sub.validate(&Segwitv0::SANE).map_err(Error::Validation)?;
         Ok(Self { ms: sub })
     }
 }

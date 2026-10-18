@@ -168,6 +168,10 @@ impl<Pk: FromStrKey> FromTree for Bare<Pk> {
     fn from_tree(root: expression::TreeIterItem) -> Result<Self, Error> {
         let sub = Miniscript::<Pk, BareCtx>::from_tree(root)?;
         BareCtx::top_level_checks(&sub)?;
+        // Enforce the same sanity rules as parsing a Miniscript directly:
+        // reject non-B top-level fragments, sigless branches, duplicate keys,
+        // malleable constructions and raw pubkey hashes.
+        sub.validate(&BareCtx::SANE).map_err(Error::Validation)?;
         Self::new(sub)
     }
 }
