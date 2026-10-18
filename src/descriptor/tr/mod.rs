@@ -17,7 +17,7 @@ use crate::prelude::*;
 use crate::util::{varint_len, witness_size};
 use crate::{
     Error, ForEachKey, FromStrKey, MiniscriptKey, ParseError, Satisfier, ScriptContext, Tap,
-    Threshold, ToPublicKey, TranslateErr, Translator, ValidationParams,
+    Threshold, ToPublicKey, TranslateErr, Translator,
 };
 
 mod spend_info;
@@ -342,6 +342,22 @@ impl<Pk: FromStrKey> core::str::FromStr for Tr<Pk> {
 
 impl<Pk: FromStrKey> crate::expression::FromTree for Tr<Pk> {
     fn from_tree(root: expression::TreeIterItem) -> Result<Self, Error> {
+        Self::from_tree_with_leaf_params(root, &Tap::SANE)
+    }
+}
+
+impl<Pk: FromStrKey> Tr<Pk> {
+    /// Parse an expression tree into a `Tr` descriptor, validating every
+    /// leaf with the given validation parameters.
+    ///
+    /// Callers parsing untrusted descriptor text must use the sane path
+    /// ([`FromTree::from_tree`]/[`FromStr`]), which uses [`Tap::SANE`]: it
+    /// rejects signatureless branches, duplicate keys and raw pubkey hashes
+    /// in taproot leaves.
+    fn from_tree_with_leaf_params(
+        root: expression::TreeIterItem,
+        leaf_params: &crate::ValidationParams,
+    ) -> Result<Self, Error> {
         use crate::expression::{Parens, ParseTreeError};
 
         root.verify_toplevel("tr", 1..=2)
@@ -378,16 +394,26 @@ impl<Pk: FromStrKey> crate::expression::FromTree for Tr<Pk> {
                 tree_builder.push_inner_node()?;
             } else {
                 let script = Miniscript::from_tree(node)?;
-                // FIXME hack for https://github.com/rust-bitcoin/rust-miniscript/issues/734
-                script
-                    .validate(&ValidationParams { allow_raw_pkh: false, ..Tap::CONSENSUS })
-                    .map_err(Error::Validation)?;
+                script.validate(leaf_params).map_err(Error::Validation)?;
 
                 tree_builder.push_leaf(script);
                 tap_tree_iter.skip_descendants();
             }
         }
         Self::new(internal_key, Some(tree_builder.finalize()))
+    }
+
+    /// Test-only escape hatch mirroring the historical permissive parse:
+    /// leaves validated with `Tap::CONSENSUS` (plus no-raw-pkh), used by the
+    /// merkle-tree fixed-vector tests which intentionally contain insane
+    /// (signatureless/unsatisfiable) leaves.
+    #[cfg(test)]
+    pub(crate) fn from_str_consensus_test(s: &str) -> Result<Self, Error> {
+        let top = expression::Tree::from_str(s)?;
+        Self::from_tree_with_leaf_params(
+            top.root(),
+            &crate::ValidationParams { allow_raw_pkh: false, ..Tap::CONSENSUS },
+        )
     }
 }
 
@@ -554,6 +580,38 @@ mod tests {
         assert_display_roundtrip(&descriptor());
         assert_display_roundtrip("tr(acc0,{pk(acc1),{pk(acc2),pk(acc3)}})");
         assert_display_roundtrip("tr(acc0,{{pk(acc1),pk(acc2)},{pk(acc3),pk(acc4)}})");
+    }
+
+    #[test]
+    fn tr_rejects_insane_leaves() {
+        // Parsing a taproot descriptor must enforce Tap::SANE on every leaf:
+        // no sigless branches, no duplicate keys, no raw pubkey hashes.
+        // The regression is that `Tr::from_str` used `Tap::CONSENSUS` instead.
+        let k = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let k2 = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        let h = "1".repeat(40);
+
+        for bad in [
+            format!("tr({k},or_i(pk({k}),1))"), // sigless alternative branch
+            format!("tr({k},after(1))"),        // no signature at all
+            format!("tr({k},multi_a(2,{k},{k},{k2}))"), // duplicate key in multi_a
+            format!("tr({k},c:expr_raw_pkh({h}))"), // raw pubkey hash
+        ] {
+            // Every public parse entry point must agree on rejection.
+            Tr::<String>::from_str(&bad).unwrap_err();
+            Tr::<bitcoin::PublicKey>::from_str(&bad).unwrap_err();
+            crate::Descriptor::<crate::DescriptorPublicKey>::from_str(&bad).unwrap_err();
+            crate::Descriptor::<bitcoin::PublicKey>::from_str(&bad).unwrap_err();
+        }
+        // Sane controls still parse via both entry points.
+        for good in [
+            format!("tr({k})"),
+            format!("tr({k},pk({k}))"),
+            format!("tr({k},or_b(pk({k}),s:pk({k2})))"),
+        ] {
+            Tr::<String>::from_str(&good).unwrap();
+            crate::Descriptor::<crate::DescriptorPublicKey>::from_str(&good).unwrap();
+        }
     }
 
     #[test]

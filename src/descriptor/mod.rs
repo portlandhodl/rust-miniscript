@@ -24,7 +24,7 @@ use sync::Arc;
 use crate::expression::FromTree as _;
 use crate::miniscript::decode::Terminal;
 use crate::miniscript::limits::MAX_PUBKEYS_PER_MULTISIG;
-use crate::miniscript::{satisfy, Legacy, Miniscript, ScriptContext as _, Segwitv0, Tap};
+use crate::miniscript::{satisfy, Legacy, Miniscript, Segwitv0};
 use crate::plan::{AssetProvider, Plan};
 use crate::prelude::*;
 use crate::{
@@ -1166,15 +1166,10 @@ impl<Pk: FromStrKey> FromStr for Descriptor<Pk> {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Error> {
         let top = expression::Tree::from_str(s)?;
-        let ret = Self::from_tree(top.root())?;
-        if let Self::Tr(ref inner) = ret {
-            for item in inner.leaves() {
-                item.miniscript()
-                    .validate(&Tap::SANE)
-                    .map_err(Error::Validation)?;
-            }
-        }
-        Ok(ret)
+        // Note: `FromTree` for every descriptor type validates sanity rules
+        // (`Tr::from_tree` validates every taproot leaf with `Tap::SANE`), so
+        // no wrapper-specific re-validation is needed here.
+        Self::from_tree(top.root())
     }
 }
 

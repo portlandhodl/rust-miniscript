@@ -678,9 +678,11 @@ mod tests {
     #[test]
     fn spend_info_fixed_vectors() {
         for (s, tree, leaves) in test_cases() {
-            let tr = s
-                .parse::<crate::descriptor::Tr<bitcoin::PublicKey>>()
-                .unwrap();
+            // These vectors intentionally contain insane leaves (signatureless
+            // `0`/`1`/`uu:0` fragments) to exercise tree hashing; parsing them
+            // needs the consensus-level test path rather than the sane one.
+            let tr =
+                crate::descriptor::Tr::<bitcoin::PublicKey>::from_str_consensus_test(&s).unwrap();
             let spend_info = tr.spend_info();
 
             assert_eq!(
